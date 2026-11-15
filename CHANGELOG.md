@@ -1,3 +1,12 @@
+## 0.23.0 — expose lazy resolver targets in unresolved-bind diagnostics
+
+- Preserve the exact provider export reached through the declared dependency's LC_REEXPORT_DYLIB chain for each unresolved binding.
+- Report export flags, stub guest address, resolver guest address, and whether the resolver address is mapped executable.
+- Classify common blockers explicitly, including lazy STUB_AND_RESOLVER resolver execution, thread-local exports, absolute exports, missing reexports, and unmapped addresses.
+- Keep lazy STUB_AND_RESOLVER pointers unresolved; do not substitute the stub for the resolver's returned implementation address.
+- Add a synthetic regression proving the reported resolver address is the provider's executable guest address while the lazy import stays unresolved.
+- Full Xcode build and live M4 v0.23.0 validation remain outstanding.
+
 ## 0.22.0 — correct Mach-O STUB_AND_RESOLVER bind handling
 
 - Resolve a cached or main-image STUB_AND_RESOLVER export to its stub address for non-lazy pointer binds.

@@ -682,6 +682,18 @@ final class LauncherViewModel: ObservableObject {
                     for route in diagnostic.candidateRoutes.prefix(2) {
                         append("    candidate path (diagnostic only): \(route)")
                     }
+                    append("    binding blocker: \(diagnostic.resolutionBlocker.explanation)")
+                    if let provider = diagnostic.candidateExportProviderInstallName {
+                        let flags = diagnostic.candidateExportFlags.map { String(format: "0x%llX", $0) } ?? "unknown"
+                        append("    exact export provider: \(provider); flags=\(flags)")
+                    }
+                    if let stub = diagnostic.candidateStubAddress {
+                        append(String(format: "    export stub guest address: 0x%016llX", stub))
+                    }
+                    if let resolver = diagnostic.candidateResolverAddress {
+                        let executable = diagnostic.candidateResolverIsExecutable == true ? "yes" : "no"
+                        append(String(format: "    export resolver guest address: 0x%016llX; mapped executable: %@", resolver, executable))
+                    }
                 }
                 append("The main image was reloaded transactionally against guest addresses from materialized cache pages. This does not initialize dyld, resolve every symbol form, create TLS/errno, or execute LC_MAIN.")
             } catch {

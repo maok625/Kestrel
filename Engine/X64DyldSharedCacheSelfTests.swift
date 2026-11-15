@@ -485,7 +485,23 @@ enum X64DyldSharedCacheSelfTests {
             try expect(lazyImage.lazyBindActions.count == 1, "lazy STUB_AND_RESOLVER fixture stream")
             try expect(lazyResolution.resolvedImportCount == 0, "lazy STUB_AND_RESOLVER is not eagerly bound to its stub")
             try expect(lazyResolution.unresolvedImportCount == 1, "lazy resolver remains explicitly unresolved")
-            passed.append("STUB_AND_RESOLVER exports use their stub for non-lazy binds; lazy binds remain unresolved until guest resolver execution is supported")
+            let lazyDiagnostic = try unwrap(
+                lazyResolution.unresolvedBindingDiagnostics.first,
+                "lazy STUB_AND_RESOLVER diagnostic"
+            )
+            try expect(
+                lazyDiagnostic.resolutionBlocker == .lazyResolverExecutionRequired,
+                "lazy binding identifies guest resolver execution as its blocker"
+            )
+            try expect(
+                lazyDiagnostic.candidateExportProviderInstallName == cache.images[0].installName,
+                "lazy diagnostic identifies the actual reexport-chain provider"
+            )
+            try expect(lazyDiagnostic.candidateExportFlags == 0x10, "lazy diagnostic preserves STUB_AND_RESOLVER export flags")
+            try expect(lazyDiagnostic.candidateStubAddress == 0x7FFF_0000_0100, "lazy diagnostic reports the stub guest address")
+            try expect(lazyDiagnostic.candidateResolverAddress == 0x7FFF_0000_0200, "lazy diagnostic reports the resolver guest address")
+            try expect(lazyDiagnostic.candidateResolverIsExecutable == true, "lazy diagnostic confirms resolver is mapped executable")
+            passed.append("Lazy STUB_AND_RESOLVER imports report the exact provider, stub, executable resolver address, and guest-execution blocker without unsafe eager binding")
         }
 
         do {

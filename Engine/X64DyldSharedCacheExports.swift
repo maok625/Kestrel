@@ -352,6 +352,44 @@ enum X64DyldSharedCacheReexportPlanner {
     }
 }
 
+enum X64DyldUnresolvedBindingReason: String, Sendable {
+    case unsupportedBindType
+    case noExportInDeclaredReexportChain
+    case absoluteExportRequiresDyldHandling
+    case threadLocalExportRequiresTLS
+    case weakLookupRequiresWeakDefinition
+    case lazyResolverExecutionRequired
+    case exportAddressOverflow
+    case exportAddressOutsideImage
+    case exportAddressNotMapped
+    case unresolvedForOtherReason
+
+    var explanation: String {
+        switch self {
+        case .unsupportedBindType:
+            return "The bind type is not supported by Kestrel."
+        case .noExportInDeclaredReexportChain:
+            return "No definition was found in the declared dependency or its explicit LC_REEXPORT_DYLIB chain."
+        case .absoluteExportRequiresDyldHandling:
+            return "The candidate is an absolute export and needs dyld-specific handling."
+        case .threadLocalExportRequiresTLS:
+            return "The candidate is thread-local and requires per-thread TLS support."
+        case .weakLookupRequiresWeakDefinition:
+            return "Weak lookup found no eligible weak definition."
+        case .lazyResolverExecutionRequired:
+            return "The candidate is STUB_AND_RESOLVER; a lazy bind requires executing its resolver and using the returned address."
+        case .exportAddressOverflow:
+            return "The candidate export address overflows the guest address space."
+        case .exportAddressOutsideImage:
+            return "The candidate export address is outside its provider's declared segments."
+        case .exportAddressNotMapped:
+            return "The candidate export address is not mapped in guest memory."
+        case .unresolvedForOtherReason:
+            return "A candidate exists, but it did not satisfy the current binding rules."
+        }
+    }
+}
+
 struct X64DyldUnresolvedBindingDiagnostic: Sendable {
     let symbolName: String
     let libraryOrdinal: Int
@@ -361,6 +399,15 @@ struct X64DyldUnresolvedBindingDiagnostic: Sendable {
     /// Candidate providers reachable through ordinary dependency edges. The
     /// route labels make it explicit which edges are not LC_REEXPORT_DYLIB.
     let candidateRoutes: [String]
+    /// The actual provider found through the declared dependency's reexport
+    /// chain, if one exists. This is deliberately distinct from diagnostic-only
+    /// providers found elsewhere in the load graph.
+    let candidateExportProviderInstallName: String?
+    let candidateExportFlags: UInt64?
+    let candidateStubAddress: UInt64?
+    let candidateResolverAddress: UInt64?
+    let candidateResolverIsExecutable: Bool?
+    let resolutionBlocker: X64DyldUnresolvedBindingReason
 }
 
 struct X64DyldDependencyRouteResult: Sendable, Equatable {
@@ -576,6 +623,69 @@ enum X64DyldSharedCacheImportResolver {
                   imageMetadata.segments.contains(where: { address >= $0.virtualAddress && address < $0.virtualEnd }),
                   guestMemory.region(containing: address) != nil else { return nil }
             return address
+        }
+
+        /// Returns the concrete export provider reached only through the
+        /// declared image and its explicit reexport edges. Ordinary transitive
+        /// dependencies are intentionally not considered here.
+        func findExportCandidate(
+            symbol: String,
+            from installName: String,
+            depth: Int,
+            visited: Set<String>
+        ) throws -> (provider: String, metadata: X64CachedImageMetadata, export: X64MachOExport)? {
+            guard depth <= maximumReexportDepth,
+                  !visited.contains(installName),
+                  let imageMetadata = try metadata(for: installName) else { return nil }
+            let nextVisited = visited.union([installName])
+
+            if let export = imageMetadata.exportsByName[symbol] {
+                if export.isReexport {
+                    guard let ordinal = export.reexportOrdinal,
+                          let dependency = imageMetadata.dependencies.first(where: { $0.ordinal == ordinal }) else {
+                        return nil
+                    }
+                    let forwardedName = (export.importedName?.isEmpty == false) ? export.importedName! : symbol
+                    return try findExportCandidate(
+                        symbol: forwardedName,
+                        from: dependency.installName,
+                        depth: depth + 1,
+                        visited: nextVisited
+                    )
+                }
+                return (installName, imageMetadata, export)
+            }
+
+            for dependency in imageMetadata.dependencies where dependency.kind == .reexport {
+                if let candidate = try findExportCandidate(
+                    symbol: symbol,
+                    from: dependency.installName,
+                    depth: depth + 1,
+                    visited: nextVisited
+                ) {
+                    return candidate
+                }
+            }
+            return nil
+        }
+
+        func guestAddress(for offset: UInt64?, in metadata: X64CachedImageMetadata) -> UInt64? {
+            guard let offset else { return nil }
+            let (address, overflow) = metadata.image.machHeaderAddress.addingReportingOverflow(offset)
+            return overflow ? nil : address
+        }
+
+        func isExecutableGuestAddress(_ address: UInt64?, in metadata: X64CachedImageMetadata) -> Bool? {
+            guard let address else { return nil }
+            let belongsToExecutableSegment = metadata.segments.contains {
+                address >= $0.virtualAddress && address < $0.virtualEnd
+            }
+            guard belongsToExecutableSegment,
+                  guestMemory.region(containing: address) != nil,
+                  let permissions = guestMemory.permissions(at: address) else {
+                return false
+            }
+            return permissions.contains(.execute)
         }
 
         // Build the load-order dependency closure. dyld recursively loads
@@ -803,13 +913,70 @@ enum X64DyldSharedCacheImportResolver {
             } else {
                 routes = []
             }
+            let exportCandidate: (provider: String, metadata: X64CachedImageMetadata, export: X64MachOExport)?
+            if let dependency = missing.dependency {
+                exportCandidate = try findExportCandidate(
+                    symbol: action.symbolName,
+                    from: dependency,
+                    depth: 0,
+                    visited: []
+                )
+            } else {
+                exportCandidate = nil
+            }
+
+            let stubAddress = exportCandidate.flatMap {
+                guestAddress(for: $0.export.addressOffset, in: $0.metadata)
+            }
+            let resolverAddress = exportCandidate.flatMap {
+                guestAddress(for: $0.export.resolverOffset, in: $0.metadata)
+            }
+            let resolverIsExecutable = exportCandidate.flatMap {
+                isExecutableGuestAddress(resolverAddress, in: $0.metadata)
+            }
+
+            let blocker: X64DyldUnresolvedBindingReason
+            if action.type != 1 {
+                blocker = .unsupportedBindType
+            } else if let candidate = exportCandidate {
+                if candidate.export.isAbsolute {
+                    blocker = .absoluteExportRequiresDyldHandling
+                } else if candidate.export.isThreadLocal {
+                    blocker = .threadLocalExportRequiresTLS
+                } else if action.libraryOrdinal == specialOrdinalWeakLookup && !candidate.export.isWeakDefinition {
+                    blocker = .weakLookupRequiresWeakDefinition
+                } else if candidate.export.hasStubAndResolver && action.stream == .lazy {
+                    blocker = .lazyResolverExecutionRequired
+                } else if stubAddress == nil {
+                    blocker = .exportAddressOverflow
+                } else if !candidate.metadata.segments.contains(where: {
+                    stubAddress! >= $0.virtualAddress && stubAddress! < $0.virtualEnd
+                }) {
+                    blocker = .exportAddressOutsideImage
+                } else if guestMemory.region(containing: stubAddress!) == nil {
+                    blocker = .exportAddressNotMapped
+                } else {
+                    blocker = .unresolvedForOtherReason
+                }
+            } else if missing.dependency != nil {
+                blocker = .noExportInDeclaredReexportChain
+            } else {
+                blocker = .unresolvedForOtherReason
+            }
+
             unresolvedBindingDiagnostics.append(X64DyldUnresolvedBindingDiagnostic(
                 symbolName: action.symbolName,
                 libraryOrdinal: action.libraryOrdinal,
                 dependencyInstallName: missing.dependency,
                 stream: action.stream.rawValue,
                 isWeakImport: action.isWeakImport,
-                candidateRoutes: Array(routes.prefix(3))
+                candidateRoutes: Array(routes.prefix(3)),
+                candidateExportProviderInstallName: exportCandidate?.provider,
+                candidateExportFlags: exportCandidate?.export.flags,
+                candidateStubAddress: stubAddress,
+                candidateResolverAddress: resolverAddress,
+                candidateResolverIsExecutable: resolverIsExecutable,
+                resolutionBlocker: blocker
             ))
         }
 

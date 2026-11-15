@@ -1,3 +1,10 @@
+## v0.23.0 — expose lazy resolver targets in unresolved-bind diagnostics
+
+- Unresolved imports now report the exact export provider reached through the declared reexport chain, its flags, stub/resolver guest addresses, and whether the resolver target is executable.
+- Common unresolved causes are classified instead of reporting only a candidate dependency path.
+- Lazy STUB_AND_RESOLVER imports remain unresolved until the guest resolver can be executed safely.
+- A synthetic regression validates the resolver address and confirms Kestrel does not bind the lazy slot to the stub.
+
 ## v0.22.0 — correct Mach-O STUB_AND_RESOLVER bind handling
 
 - Non-lazy pointer binds can now resolve a STUB_AND_RESOLVER export to its stub address.
