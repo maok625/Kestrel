@@ -147,9 +147,22 @@ enum X64ARM64Runtime {
             case 0x01: access = .read
             case 0x02: access = .write
             case 0x04: access = .execute
-            default: exit = .memoryFault; return X64ARM64BlockResult(arm64Words: words, exit: exit)
+            default:
+                exit = .memoryFault
+                return X64ARM64BlockResult(
+                    arm64Words: words,
+                    exit: exit
+                )
             }
-            exit = .demandZeroFault(address: faultAddress, access: access)
+
+            if memory.isDemandZero(address: faultAddress) {
+                exit = .demandZeroFault(
+                    address: faultAddress,
+                    access: access
+                )
+            } else {
+                exit = .memoryFault
+            }
         default: throw RuntimeError.invalidBlockResult(blockResult)
         }
         return X64ARM64BlockResult(arm64Words: words, exit: exit)
