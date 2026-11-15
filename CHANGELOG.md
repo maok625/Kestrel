@@ -1,3 +1,12 @@
+## 0.21.0 — bounded reexport-provider cache materialization
+
+- Extend the shared-cache page plan from the executable's direct dylibs to the exact cached images reachable through LC_REEXPORT_DYLIB commands and explicit export-trie reexport ordinals.
+- Do not expand ordinary LC_LOAD_DYLIB, weak-load, upward-load, or lazy-load edges for page materialization; this avoids copying the complete 555-image metadata dependency closure.
+- Parse one image's export metadata at a time and discard it after collecting provider edges. Bound selection to 1,024 selected images, 4,096 queued install names, 128 MiB of export tries, and 2,000,000 exports.
+- Feed the selected exact install names into the existing shared-cache segment mapper, which globally deduplicates overlapping page ranges. Reuse the transactional page copier, slide-info v2 fixups, cache-derived protections, and 2 GiB backing ceiling.
+- Add regressions proving an LC_REEXPORT_DYLIB provider is included in the page plan while an ordinary LC_LOAD_DYLIB target is not.
+- Portable Swift validation: 144/144 checks pass with warnings treated as errors under Swift 6.2.1. Full Xcode build and live M4 v0.21.0 validation remain outstanding.
+
 ## 0.20.0 — responsive launcher, faster JIT bridge, headless tests
 
 - Run all long operations (self-tests, Mach-O load, shared-cache inspect/analyze) off the main actor, matching the existing detached materialize/resolve steps.

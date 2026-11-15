@@ -239,6 +239,119 @@ enum X64DyldSharedCacheImageMetadataReader {
     }
 }
 
+// MARK: - Minimal shared-cache reexport-provider materialization
+
+/// The selected cached images whose guest pages are needed to satisfy imports
+/// exposed through direct dylib reexports. This is intentionally much smaller
+/// than the complete transitive dependency metadata closure: ordinary
+/// LC_LOAD_DYLIB edges are not followed for page materialization.
+struct X64DyldSharedCacheReexportSelection: Sendable, Equatable {
+    let installNames: [String]
+    let rootImageCount: Int
+    let missingInstallNames: [String]
+    let parsedExportCount: Int
+    let exportTrieBytes: Int
+    let truncated: Bool
+}
+
+enum X64DyldSharedCacheReexportPlanner {
+    private static let maximumImages = 1_024
+    private static let maximumQueuedImages = 4_096
+    private static let maximumExportBytes = 128 * 1024 * 1024
+    private static let maximumExportCount = 2_000_000
+
+    /// Starts with the executable's direct dependencies and follows only
+    /// LC_REEXPORT_DYLIB edges plus explicit EXPORT_SYMBOL_FLAGS_REEXPORT
+    /// targets. All other dependency commands are intentionally excluded.
+    /// Install names are matched exactly; no basename or framework-name
+    /// guessing is performed. Each image's export metadata is discarded after
+    /// its outgoing reexport edges are collected, so the planner does not keep
+    /// hundreds of decoded export tries alive while building the page plan.
+    static func select(
+        cache: X64DyldSharedCacheSummary,
+        roots: [X64MachODylibDependency]
+    ) throws -> X64DyldSharedCacheReexportSelection {
+        let imageByPath = Dictionary(
+            cache.images.map { ($0.installName, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var queue: [String] = []
+        var discoveredPaths = Set<String>()
+        var truncated = false
+
+        func enqueue(_ installName: String) {
+            guard discoveredPaths.insert(installName).inserted else { return }
+            guard queue.count < maximumQueuedImages else {
+                truncated = true
+                return
+            }
+            queue.append(installName)
+        }
+        for dependency in roots { enqueue(dependency.installName) }
+
+        var selected: [String] = []
+        var missing: [String] = []
+        var totalExportBytes = 0
+        var totalExportCount = 0
+        var rootImageCount = 0
+        var queueIndex = 0
+        let rootPaths = Set(roots.map(\.installName))
+
+        while queueIndex < queue.count {
+            let installName = queue[queueIndex]
+            queueIndex += 1
+
+            guard selected.count < maximumImages else {
+                truncated = true
+                break
+            }
+            guard let image = imageByPath[installName], image.hasReadableX86_64Header else {
+                missing.append(installName)
+                continue
+            }
+
+            // The path is enqueued once globally, so there is no need to cache
+            // the entire parsed metadata object after this iteration.
+            let metadata = try X64DyldSharedCacheImageMetadataReader.read(cache: cache, image: image)
+            let (newBytes, byteOverflow) = totalExportBytes.addingReportingOverflow(metadata.exportTrieByteCount)
+            let (newExports, exportOverflow) = totalExportCount.addingReportingOverflow(metadata.exports.count)
+            guard !byteOverflow, !exportOverflow,
+                  newBytes <= maximumExportBytes,
+                  newExports <= maximumExportCount else {
+                throw X64DyldSharedCacheError.malformed("Reexport-provider metadata exceeds Kestrel's bounded export parsing limits.")
+            }
+            totalExportBytes = newBytes
+            totalExportCount = newExports
+
+            selected.append(installName)
+            if rootPaths.contains(installName) { rootImageCount += 1 }
+
+            // LC_REEXPORT_DYLIB commands preserve the runtime search order
+            // recorded by the parent Mach-O. Explicit export-trie reexports
+            // can target other dependency commands by their original ordinal.
+            for dependency in metadata.dependencies where dependency.kind == .reexport {
+                enqueue(dependency.installName)
+            }
+            for export in metadata.exports where export.isReexport {
+                guard let ordinal = export.reexportOrdinal,
+                      let dependency = metadata.dependencies.first(where: { $0.ordinal == ordinal }) else {
+                    throw X64DyldSharedCacheError.malformed("Cached image \(installName) contains an export-trie reexport with an invalid dependency ordinal.")
+                }
+                enqueue(dependency.installName)
+            }
+        }
+
+        return X64DyldSharedCacheReexportSelection(
+            installNames: selected,
+            rootImageCount: rootImageCount,
+            missingInstallNames: Array(Set(missing)).sorted(),
+            parsedExportCount: totalExportCount,
+            exportTrieBytes: totalExportBytes,
+            truncated: truncated || queueIndex < queue.count
+        )
+    }
+}
+
 struct X64DyldUnresolvedBindingDiagnostic: Sendable {
     let symbolName: String
     let libraryOrdinal: Int

@@ -487,25 +487,46 @@ final class LauncherViewModel: ObservableObject {
         }
         isBusy = true
         let dependencies = loadedMachOImage.dependencies
-        let dependencyCount = dependencies.count
         Task {
             do {
                 let planned = try await Task.detached(priority: .userInitiated) {
                     let cache = try X64DyldSharedCacheReader.discoverDefault()
+                    let reexportSelection = try X64DyldSharedCacheReexportPlanner.select(
+                        cache: cache,
+                        roots: dependencies
+                    )
+                    let mappingDependencies = reexportSelection.installNames.enumerated().map { index, installName in
+                        X64MachODylibDependency(
+                            ordinal: index + 1,
+                            installName: installName,
+                            timestamp: 0,
+                            currentVersion: 0,
+                            compatibilityVersion: 0,
+                            kind: .load
+                        )
+                    }
                     let plan = try X64DyldSharedCacheImageMapper.makePlan(
                         cache: cache,
-                        dependencies: dependencies
+                        dependencies: mappingDependencies
                     )
-                    return (cache, plan)
+                    return (cache, plan, reexportSelection)
                 }.value
                 let cache = planned.0
                 let plan = planned.1
+                let reexportSelection = planned.2
                 inspectedDyldSharedCache = cache
                 plannedDyldSharedCacheMappings = plan
                 let withinMaterializationLimit = plan.totalPageRoundedReservationBytes <= LauncherViewModel.materializationLimitBytes
                 canMaterializeCachedDependencies = withinMaterializationLimit
-                append("PASS: cached dependency Mach-O mapping preflight completed.")
-                append("Cache UUID: \(plan.cacheUUID); exact dependency images parsed: \(plan.images.count)/\(dependencyCount)")
+                append("PASS: cached dependency and reexport-provider mapping preflight completed.")
+                append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependency images: \(reexportSelection.rootImageCount); additional reexport providers: \(max(0, plan.images.count - reexportSelection.rootImageCount))")
+                append("Reexport metadata parsed: \(reexportSelection.parsedExportCount) exports from \(reexportSelection.exportTrieBytes) bytes of export tries.")
+                if reexportSelection.truncated {
+                    append("WARNING: reexport-provider selection reached a safety limit (1,024 images or 4,096 queued names); imports from later providers may remain unresolved.")
+                }
+                if !reexportSelection.missingInstallNames.isEmpty {
+                    append("Reexport providers absent from this cache: \(reexportSelection.missingInstallNames.prefix(12).joined(separator: ", "))")
+                }
                 append("Cache VM mappings available: \(plan.reservedMappingCount); segment commands validated: \(plan.totalSegmentCount)")
                 append("Executable segments inventoried: \(plan.executableSegmentCount); __LINKEDIT segments: \(plan.linkeditSegmentCount)")
                 append("Exact guest segment bytes: \(plan.totalVirtualBytes); page-rounded reservation bytes: \(plan.totalPageRoundedReservationBytes) (virtual reservation only; no host pages allocated)")
@@ -531,7 +552,7 @@ final class LauncherViewModel: ObservableObject {
                         append(String(format: "    %@ exact 0x%016llX + 0x%llX; guest pages 0x%016llX + 0x%llX; segment prot max=0x%X init=0x%X", segment.name, segment.virtualAddress, segment.virtualSize, segment.pageRoundedAddress, segment.pageRoundedSize, segment.maximumProtection, segment.initialProtection))
                     }
                 }
-                append("PREFLIGHT COMPLETE: every selected segment page is covered by a cache mapping and slide-info v2 chains were validated. No guest memory was changed yet. The next action copies the selected pages into guest-owned backing, applies valueAdd with a zero guest slide, then installs the cache mapping protections.")
+                append("PREFLIGHT COMPLETE: direct dependency pages and their declared reexport-provider pages are covered by cache mappings. The next action copies the selected pages into guest-owned backing, applies validated slide-info v2 fixups, then installs cache mapping protections. Ordinary LC_LOAD_DYLIB edges are not recursively materialized.")
             } catch {
                 append("DYLD CACHE MAPPING PREFLIGHT FAILED: \(error.localizedDescription)")
             }
