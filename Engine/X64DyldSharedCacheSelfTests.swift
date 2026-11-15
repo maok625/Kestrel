@@ -451,6 +451,44 @@ enum X64DyldSharedCacheSelfTests {
         }
 
         do {
+            let url = try makeCacheFileWithExports(stubAndResolver: true)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            var regularMemory = try X64GuestVirtualMemory()
+            try regularMemory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
+            try regularMemory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
+            let regularImage = try X64MachOParser.parse(data: X64MachOLoaderSelfTests.makeBoundThinExecutable())
+            let regularResolution = try X64DyldSharedCacheImportResolver.build(
+                cache: cache,
+                executable: regularImage,
+                guestMemory: regularMemory,
+                baseResolver: X64MachOSymbolResolver()
+            )
+            try expect(regularResolution.resolvedImportCount == 1, "non-lazy STUB_AND_RESOLVER export resolves")
+            try expect(
+                regularResolution.resolver.resolve(symbol: "_puts", dependency: regularImage.dependencies[0]) == 0x7FFF_0000_0100,
+                "non-lazy bind uses the export's stub offset, not its resolver offset"
+            )
+
+            var lazyMemory = try X64GuestVirtualMemory()
+            try lazyMemory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
+            try lazyMemory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
+            let lazyImage = try X64MachOParser.parse(
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(bindStream: .lazy)
+            )
+            let lazyResolution = try X64DyldSharedCacheImportResolver.build(
+                cache: cache,
+                executable: lazyImage,
+                guestMemory: lazyMemory,
+                baseResolver: X64MachOSymbolResolver()
+            )
+            try expect(lazyImage.lazyBindActions.count == 1, "lazy STUB_AND_RESOLVER fixture stream")
+            try expect(lazyResolution.resolvedImportCount == 0, "lazy STUB_AND_RESOLVER is not eagerly bound to its stub")
+            try expect(lazyResolution.unresolvedImportCount == 1, "lazy resolver remains explicitly unresolved")
+            passed.append("STUB_AND_RESOLVER exports use their stub for non-lazy binds; lazy binds remain unresolved until guest resolver execution is supported")
+        }
+
+        do {
             let url = try makeCacheFileWithLoadCommandReexport()
             defer { try? FileManager.default.removeItem(at: url) }
             let cache = try X64DyldSharedCacheReader.open(url)
@@ -787,7 +825,10 @@ enum X64DyldSharedCacheSelfTests {
         return url
     }
 
-    private static func makeCacheFileWithExports(weakDefinition: Bool = false) throws -> URL {
+    private static func makeCacheFileWithExports(
+        weakDefinition: Bool = false,
+        stubAndResolver: Bool = false
+    ) throws -> URL {
         let url = try makeCacheFile()
         var data = try Data(contentsOf: url)
         // Only the first cached image is used by this fixture. Its __TEXT
@@ -819,11 +860,16 @@ enum X64DyldSharedCacheSelfTests {
         data.writeLE32(0x8000_0033, at: cursor) // LC_DYLD_EXPORTS_TRIE
         data.writeLE32(16, at: cursor + 4)
         data.writeLE32(0x2000, at: cursor + 8)
-        data.writeLE32(14, at: cursor + 12)
-
-        // Root -> "_puts" -> regular export at __TEXT + 0x100.
-        let exportFlags: UInt8 = weakDefinition ? 0x04 : 0x00
-        let trie: [UInt8] = [0x00, 0x01, 0x5F, 0x70, 0x75, 0x74, 0x73, 0x00, 0x09, 0x03, exportFlags, 0x80, 0x02, 0x00]
+        // Root -> "_puts" -> regular export at __TEXT + 0x100, or a
+        // STUB_AND_RESOLVER export with stub +0x100 and resolver +0x200.
+        let exportFlags = UInt8((weakDefinition ? 0x04 : 0x00) | (stubAndResolver ? 0x10 : 0x00))
+        var trie: [UInt8] = [0x00, 0x01, 0x5F, 0x70, 0x75, 0x74, 0x73, 0x00, 0x09]
+        if stubAndResolver {
+            trie.append(contentsOf: [0x05, exportFlags, 0x80, 0x02, 0x80, 0x04, 0x00])
+        } else {
+            trie.append(contentsOf: [0x03, exportFlags, 0x80, 0x02, 0x00])
+        }
+        data.writeLE32(UInt32(trie.count), at: cursor + 12)
         data.replaceSubrange(0x2000..<(0x2000 + trie.count), with: trie)
         try data.write(to: url, options: .atomic)
         return url

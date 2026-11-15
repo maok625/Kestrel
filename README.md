@@ -1,3 +1,10 @@
+## v0.22.0 — correct Mach-O STUB_AND_RESOLVER bind handling
+
+- Non-lazy pointer binds can now resolve a STUB_AND_RESOLVER export to its stub address.
+- Lazy binds to these exports remain unresolved until Kestrel can execute the guest resolver and use the returned implementation address.
+- The change preserves exact two-level dependency and reexport rules, with portable regressions for regular and lazy bind streams.
+- Portable validation: 145/145 checks pass with warnings treated as errors under Swift 6.2.1; a full Xcode/M4 run is still required.
+
 # Kestrel — ARM64 launcher and x86_64 translation prototype
 
 

@@ -1,3 +1,11 @@
+## 0.22.0 — correct Mach-O STUB_AND_RESOLVER bind handling
+
+- Resolve a cached or main-image STUB_AND_RESOLVER export to its stub address for non-lazy pointer binds.
+- Keep lazy binds to STUB_AND_RESOLVER exports unresolved until Kestrel can execute the guest resolver and use its returned implementation address; do not bind them to the stub or resolver entry.
+- Preserve exact dependency and reexport lookup rules, and keep guest-address validation in force.
+- Add portable regressions for regular and lazy bind streams using a synthetic stub/resolver export.
+- Portable Swift validation: 145/145 checks pass with warnings treated as errors under Swift 6.2.1. Full Xcode build and live M4 v0.22.0 validation remain outstanding.
+
 ## 0.21.0 — bounded reexport-provider cache materialization
 
 - Extend the shared-cache page plan from the executable's direct dylibs to the exact cached images reachable through LC_REEXPORT_DYLIB commands and explicit export-trie reexport ordinals.

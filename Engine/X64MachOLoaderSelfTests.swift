@@ -714,7 +714,8 @@ enum X64MachOLoaderSelfTests {
     static func makeBoundThinExecutable(
         weakImport: Bool = false,
         libraryOrdinal: Int = 1,
-        installName: String = "/usr/lib/libSystem.B.dylib"
+        installName: String = "/usr/lib/libSystem.B.dylib",
+        bindStream: X64MachOBindStreamKind = .regular
     ) -> Data {
         var data = makeThinExecutable()
         var dylib = Data()
@@ -749,12 +750,12 @@ enum X64MachOLoaderSelfTests {
         appendLE32(48, to: &dyld)
         appendLE32(0, to: &dyld) // rebase_off
         appendLE32(0, to: &dyld) // rebase_size
-        appendLE32(bindOffset, to: &dyld)
-        appendLE32(UInt32(bind.count), to: &dyld)
+        appendLE32(bindStream == .regular ? bindOffset : 0, to: &dyld)
+        appendLE32(bindStream == .regular ? UInt32(bind.count) : 0, to: &dyld)
         appendLE32(0, to: &dyld) // weak bind offset
         appendLE32(0, to: &dyld) // weak bind size
-        appendLE32(0, to: &dyld) // lazy bind offset
-        appendLE32(0, to: &dyld) // lazy bind size
+        appendLE32(bindStream == .lazy ? bindOffset : 0, to: &dyld)
+        appendLE32(bindStream == .lazy ? UInt32(bind.count) : 0, to: &dyld)
         appendLE32(0, to: &dyld) // export offset
         appendLE32(0, to: &dyld) // export size
 

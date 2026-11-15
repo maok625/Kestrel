@@ -520,7 +520,8 @@ enum X64DyldSharedCacheImportResolver {
             from installName: String,
             depth: Int,
             visited: Set<String>,
-            requireWeakDefinition: Bool = false
+            requireWeakDefinition: Bool = false,
+            allowStubAndResolver: Bool = false
         ) throws -> UInt64? {
             guard depth <= maximumReexportDepth, !visited.contains(installName),
                   let imageMetadata = try metadata(for: installName) else { return nil }
@@ -537,7 +538,8 @@ enum X64DyldSharedCacheImportResolver {
                         from: dependency.installName,
                         depth: depth + 1,
                         visited: nextVisited,
-                        requireWeakDefinition: requireWeakDefinition
+                        requireWeakDefinition: requireWeakDefinition,
+                        allowStubAndResolver: allowStubAndResolver
                     ) {
                         return address
                     }
@@ -556,11 +558,17 @@ enum X64DyldSharedCacheImportResolver {
                     from: dependency.installName,
                     depth: depth + 1,
                     visited: nextVisited,
-                    requireWeakDefinition: requireWeakDefinition
+                    requireWeakDefinition: requireWeakDefinition,
+                    allowStubAndResolver: allowStubAndResolver
                 )
             }
 
-            guard !export.isAbsolute, !export.isThreadLocal, !export.hasStubAndResolver,
+            // For a STUB_AND_RESOLVER export, dyld uses the stub address for
+            // non-lazy pointer binds. Lazy pointer binds must call the resolver
+            // and use its returned implementation address; Kestrel does not
+            // execute resolver functions yet, so those remain unresolved.
+            guard !export.isAbsolute, !export.isThreadLocal,
+                  (!export.hasStubAndResolver || allowStubAndResolver),
                   (!requireWeakDefinition || export.isWeakDefinition),
                   let addressOffset = export.addressOffset else { return nil }
             let (address, overflow) = imageMetadata.image.machHeaderAddress.addingReportingOverflow(addressOffset)
@@ -594,10 +602,15 @@ enum X64DyldSharedCacheImportResolver {
         }
 
         var resolver = baseResolver
-        func mainExecutableExportAddress(_ symbol: String, weakOnly: Bool = false) -> UInt64? {
+        func mainExecutableExportAddress(
+            _ symbol: String,
+            weakOnly: Bool = false,
+            allowStubAndResolver: Bool = false
+        ) -> UInt64? {
             guard let export = executable.exports.first(where: { $0.symbolName == symbol }),
                   !export.isReexport, !export.isAbsolute, !export.isThreadLocal,
-                  !export.hasStubAndResolver, (!weakOnly || export.isWeakDefinition),
+                  (!export.hasStubAndResolver || allowStubAndResolver),
+                  (!weakOnly || export.isWeakDefinition),
                   let offset = export.addressOffset else { return nil }
             let (address, overflow) = executable.preferredLoadAddress.addingReportingOverflow(offset)
             guard !overflow,
@@ -636,7 +649,8 @@ enum X64DyldSharedCacheImportResolver {
                     symbol: action.symbolName,
                     from: dependency.installName,
                     depth: 0,
-                    visited: []
+                    visited: [],
+                    allowStubAndResolver: action.stream != .lazy
                 ) {
                     resolver.register(symbol: action.symbolName, address: address, installName: dependency.installName)
                     resolvedImportCount += 1
@@ -660,7 +674,10 @@ enum X64DyldSharedCacheImportResolver {
                     flatLookupResolvedCount += 1
                     continue
                 }
-                if let mainAddress = mainExecutableExportAddress(action.symbolName) {
+                if let mainAddress = mainExecutableExportAddress(
+                    action.symbolName,
+                    allowStubAndResolver: action.stream != .lazy
+                ) {
                     resolver.register(symbol: action.symbolName, address: mainAddress)
                     resolvedImportCount += 1
                     flatLookupResolvedCount += 1
@@ -670,7 +687,7 @@ enum X64DyldSharedCacheImportResolver {
                 for path in dependencyLoadOrder {
                     if let address = resolver.resolveExact(symbol: action.symbolName, installName: path) {
                         matches.append((path, address))
-                    } else if let address = try resolveExport(symbol: action.symbolName, from: path, depth: 0, visited: []) {
+                    } else if let address = try resolveExport(symbol: action.symbolName, from: path, depth: 0, visited: [], allowStubAndResolver: action.stream != .lazy) {
                         matches.append((path, address))
                     }
                 }
@@ -693,7 +710,11 @@ enum X64DyldSharedCacheImportResolver {
                 // WEAK_LOOKUP is specifically a search for weak definitions;
                 // do not accept an arbitrary strong export or a host thunk
                 // merely because the base resolver has a wildcard entry.
-                if let mainWeakAddress = mainExecutableExportAddress(action.symbolName, weakOnly: true) {
+                if let mainWeakAddress = mainExecutableExportAddress(
+                    action.symbolName,
+                    weakOnly: true,
+                    allowStubAndResolver: action.stream != .lazy
+                ) {
                     resolver.registerWeak(symbol: action.symbolName, address: mainWeakAddress)
                     resolvedImportCount += 1
                     weakLookupResolvedCount += 1
@@ -708,7 +729,8 @@ enum X64DyldSharedCacheImportResolver {
                         from: path,
                         depth: 0,
                         visited: [],
-                        requireWeakDefinition: true
+                        requireWeakDefinition: true,
+                        allowStubAndResolver: action.stream != .lazy
                     ) {
                         matches.append((path, address))
                     }
