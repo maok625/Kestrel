@@ -1,0 +1,173 @@
+import Foundation
+
+enum X64DarwinRuntimeSelfTests {
+    private final class MockHost: X64DarwinSyscallHost {
+        let processIdentifier: UInt32 = 4242
+        var input: [UInt8] = [0x41, 0x42, 0x43]
+        var output: [UInt8] = []
+
+        func read(fileDescriptor: Int32, maximumCount: Int) throws -> [UInt8] {
+            guard fileDescriptor == 0 else { throw X64DarwinSyscallHostError(errno: 9) }
+            let count = min(maximumCount, input.count)
+            let result = Array(input.prefix(count))
+            input.removeFirst(count)
+            return result
+        }
+
+        func write(fileDescriptor: Int32, bytes: [UInt8]) throws -> Int {
+            guard fileDescriptor == 1 || fileDescriptor == 2 else {
+                throw X64DarwinSyscallHostError(errno: 9)
+            }
+            output.append(contentsOf: bytes)
+            return bytes.count
+        }
+    }
+
+    static func run() throws -> [String] {
+        var passed: [String] = []
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: 0x1_0000_1000,
+                mainMachHeaderAddress: 0x1_0000_0000,
+                executablePath: "/Applications/Kyty.app/Contents/MacOS/kyty_emulator",
+                arguments: ["--headless", "two words"],
+                environment: ["ZETA": "last", "ALPHA": "first"],
+                into: &memory,
+                usableStackSize: 64 * 1024
+            )
+            try expect(startup.stackPointer % 16 == 0, "kernel KernelArgs stack alignment")
+            try expect(try memory.readUnsigned(at: startup.stackPointer, byteCount: 8) == startup.mainMachHeaderAddress, "main executable mach_header pointer")
+            try expect(try memory.readUnsigned(at: startup.stackPointer + 8, byteCount: 8) == 3, "argc")
+            let argv0 = try memory.readUnsigned(at: startup.argvPointer, byteCount: 8)
+            let argv1 = try memory.readUnsigned(at: startup.argvPointer + 8, byteCount: 8)
+            let argv2 = try memory.readUnsigned(at: startup.argvPointer + 16, byteCount: 8)
+            try expect(try readCString(argv0, memory: memory) == "/Applications/Kyty.app/Contents/MacOS/kyty_emulator", "argv[0]")
+            try expect(try readCString(argv1, memory: memory) == "--headless", "argv[1]")
+            try expect(try readCString(argv2, memory: memory) == "two words", "argv[2]")
+            let env0 = try memory.readUnsigned(at: startup.envpPointer, byteCount: 8)
+            let env1 = try memory.readUnsigned(at: startup.envpPointer + 8, byteCount: 8)
+            try expect(try readCString(env0, memory: memory) == "ALPHA=first", "sorted envp[0]")
+            try expect(try readCString(env1, memory: memory) == "ZETA=last", "sorted envp[1]")
+            try expect(memory.permissions(at: startup.stackReservation.baseAddress) == nil, "low stack guard")
+            try expect(memory.permissions(at: startup.stackReservation.endAddress - 1) == nil, "high stack guard")
+            var initialState = X64CPUState()
+            let dyldEntry: UInt64 = 0x6_FFFF_F000
+            try startup.installDyldEntry(dyldEntryPoint: dyldEntry, into: &initialState)
+            try expect(initialState.rip == dyldEntry, "dyld entrypoint installed into RIP")
+            try expect(initialState.registerValue(.rsp) == startup.stackPointer, "kernel RSP points at KernelArgs")
+            try expect(initialState.registerValue(.rbp) == 0, "frame pointer chain starts terminated")
+            try expect(startup.entryPoint == 0x1_0000_1000, "LC_MAIN retained as post-dyld executable entry")
+            passed.append("Darwin kernel-style startup stack builds mach_header/argc/argv/envp/apple vectors and guard pages; dyld entry is separate from LC_MAIN")
+        }
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            _ = try memory.reserve(at: 0x2_0000_0000, byteCount: 0x2_000, kind: .anonymous)
+            try memory.commit(at: 0x2_0000_0000, byteCount: 0x2_000, permissions: .readWrite)
+            try memory.writeBytes(Array("hello".utf8), at: 0x2_0000_0100)
+            let host = MockHost()
+            var state = X64CPUState()
+            try state.writeRegister(.rax, value: 0x0200_0004, width: .qword) // write
+            try state.writeRegister(.rdi, value: 1, width: .qword)
+            try state.writeRegister(.rsi, value: 0x2_0000_0100, width: .qword)
+            try state.writeRegister(.rdx, value: 5, width: .qword)
+            let disposition = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(disposition == .continueExecution, "write disposition")
+            try expect(host.output == Array("hello".utf8), "write output")
+            try expect(state.registerValue(.rax) == 5 && !state.flagIsSet(.carry), "write success ABI")
+            passed.append("Darwin x86_64 write syscall marshals guest buffer bytes and returns RAX with CF clear")
+        }
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            _ = try memory.reserve(at: 0x2_1000_0000, byteCount: 0x1_000, kind: .anonymous)
+            try memory.commit(at: 0x2_1000_0000, byteCount: 0x1_000, permissions: .readWrite)
+            let host = MockHost()
+            var state = X64CPUState()
+            try state.writeRegister(.rax, value: 0x0200_0003, width: .qword) // read
+            try state.writeRegister(.rdi, value: 0, width: .qword)
+            try state.writeRegister(.rsi, value: 0x2_1000_0020, width: .qword)
+            try state.writeRegister(.rdx, value: 3, width: .qword)
+            _ = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(state.registerValue(.rax) == 3 && !state.flagIsSet(.carry), "read return")
+            try expect(try memory.readBytes(at: 0x2_1000_0020, count: 3) == [0x41, 0x42, 0x43], "read bytes")
+            passed.append("Darwin x86_64 read syscall copies host input into guest memory and preserves guest write permissions")
+        }
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            let lazyAddress: UInt64 = 0x2_1800_0000
+            try memory.reserve(at: lazyAddress, byteCount: 0x1000, kind: .anonymous)
+            try memory.registerDemandZeroRange(at: lazyAddress, byteCount: 0x1000, permissions: .readWrite)
+            let host = MockHost()
+            var state = X64CPUState()
+            try state.writeRegister(.rax, value: 0x0200_0004, width: .qword) // write
+            try state.writeRegister(.rdi, value: 1, width: .qword)
+            try state.writeRegister(.rsi, value: lazyAddress + 8, width: .qword)
+            try state.writeRegister(.rdx, value: 3, width: .qword)
+            _ = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(memory.isCommitted(address: lazyAddress), "write did not materialize demand-zero source page")
+            try expect(host.output == [0, 0, 0], "demand-zero write did not return zero-filled bytes")
+            try expect(state.registerValue(.rax) == 3 && !state.flagIsSet(.carry), "demand-zero write return")
+            passed.append("Darwin write syscall materializes demand-zero source pages and writes their zero-filled contents")
+        }
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            let lazyAddress: UInt64 = 0x2_2000_0000
+            try memory.reserve(at: lazyAddress, byteCount: 0x1000, kind: .anonymous)
+            try memory.registerDemandZeroRange(at: lazyAddress, byteCount: 0x1000, permissions: .readWrite)
+            let host = MockHost()
+            var state = X64CPUState()
+            try state.writeRegister(.rax, value: 0x0200_0003, width: .qword) // read
+            try state.writeRegister(.rdi, value: 0, width: .qword)
+            try state.writeRegister(.rsi, value: lazyAddress + 8, width: .qword)
+            try state.writeRegister(.rdx, value: 3, width: .qword)
+            _ = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(memory.isCommitted(address: lazyAddress), "read did not materialize demand-zero target page")
+            try expect(try memory.readBytes(at: lazyAddress + 8, count: 3) == [0x41, 0x42, 0x43], "demand-zero read bytes")
+            passed.append("Darwin read syscall materializes demand-zero guest pages before copying host input")
+        }
+
+        do {
+            var memory = try X64GuestVirtualMemory()
+            let host = MockHost()
+            var state = X64CPUState()
+            try state.writeRegister(.rax, value: 0x0200_0014, width: .qword) // getpid
+            _ = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(state.registerValue(.rax) == 4242 && !state.flagIsSet(.carry), "getpid return")
+            try state.writeRegister(.rax, value: 0x0200_FFFF, width: .qword)
+            _ = try X64DarwinSyscallDispatcher.dispatch(state: &state, memory: &memory, host: host)
+            try expect(state.registerValue(.rax) == 78 && state.flagIsSet(.carry), "ENOSYS convention")
+            passed.append("Darwin syscall return convention reports getpid, ENOSYS in RAX, and the error indicator in RFLAGS.CF")
+        }
+
+        do {
+            let registry = X64DarwinABIThunkRegistry.initialCBridge
+            try expect(registry.descriptor(for: "_read")?.argumentSources == [.rdi, .rsi, .rdx], "read ABI descriptor")
+            try expect(registry.descriptor(for: "_write")?.requiresGuestPointerTranslation == true, "write pointer translation")
+            try expect(registry.descriptor(for: "_getpid")?.argumentSources.isEmpty == true, "getpid ABI descriptor")
+            passed.append("Explicit Darwin C ABI thunk descriptors define argument registers and guest-pointer translation requirements")
+        }
+
+        return passed
+    }
+
+    private static func readCString(_ address: UInt64, memory: X64GuestVirtualMemory) throws -> String {
+        var bytes: [UInt8] = []
+        for offset in 0..<4096 {
+            let value = try memory.readBytes(at: address + UInt64(offset), count: 1)[0]
+            if value == 0 { return String(decoding: bytes, as: UTF8.self) }
+            bytes.append(value)
+        }
+        throw X64MachOFormatError(message: "Runtime test string was not NUL terminated.")
+    }
+
+    private static func expect(_ condition: @autoclosure () throws -> Bool, _ label: String) throws {
+        guard try condition() else {
+            throw X64MachOFormatError(message: "Darwin runtime self-test failed: \(label).")
+        }
+    }
+}
