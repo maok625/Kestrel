@@ -675,6 +675,25 @@ final class LauncherViewModel: ObservableObject {
                 if !result.1.unresolvedBindSymbols.isEmpty {
                     append("Unresolved import preview: \(result.1.unresolvedBindSymbols.prefix(24).joined(separator: ", "))")
                 }
+                if !result.2.lazyResolverProbeResults.isEmpty {
+                    append("ISOLATED LAZY-RESOLVER PROBES: \(result.2.lazyResolverProbeResults.count) unique resolver(s); existing writable pages protected: \(result.2.lazyResolverProtectedPageCount); one reusable snapshot with shared pages write-protected and a private writable stack; syscalls and host thunks disabled.")
+                    for probe in result.2.lazyResolverProbeResults {
+                        let detail = probe.detail.map { "; \($0)" } ?? ""
+                        append(String(
+                            format: "  RESOLVER PROBE 0x%016llX: %@; instructions=%d; blocks=%d%@",
+                            probe.resolverAddress,
+                            probe.status.rawValue,
+                            probe.instructionsExecuted,
+                            probe.blocksExecuted,
+                            detail
+                        ))
+                        if let returned = probe.returnedAddress {
+                            let executable = probe.returnedAddressIsMappedExecutable == true ? "yes" : "no"
+                            append(String(format: "    returned RAX: 0x%016llX; mapped executable: %@", returned, executable))
+                        }
+                    }
+                    append("Probe return values are diagnostic only and are NOT used to bind imports: dyld initialization, TLS and resolver side-effect semantics are not implemented.")
+                }
                 for diagnostic in result.2.unresolvedBindingDiagnostics.prefix(24) {
                     let dependency = diagnostic.dependencyInstallName ?? "special ordinal"
                     let weak = diagnostic.isWeakImport ? "; weak-import flag" : ""

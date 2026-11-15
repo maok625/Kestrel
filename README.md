@@ -1,3 +1,12 @@
+## v0.24.0 — bounded isolated dyld resolver probes
+
+- Execute each unique mapped-executable lazy resolver address once using the guest x86-64 dispatcher, with 2,048-instruction and 512-block limits.
+- Create one reusable guest-memory snapshot, remove write permission from all pre-existing committed and demand-zero pages, and allocate a separate private stack for probe calls. Shared source-page backing is therefore not writable by speculative guest code.
+- Reject guest syscalls and omit host-thunk dispatch during probes. Report normal returns, mapped-executable RAX results, guest memory faults, blocked syscalls, and execution failures.
+- Resolver return values remain diagnostic only. Kestrel does not bind imports from these probes because dyld initialization, TLS and resolver side-effect semantics are not implemented.
+- Add dispatcher regressions for a successful return, blocked writes that leave source memory unchanged, and syscall rejection.
+- Full Xcode build and live M4 validation remain outstanding.
+
 ## v0.23.0 — expose lazy resolver targets in unresolved-bind diagnostics
 
 - Unresolved imports now report the exact export provider reached through the declared reexport chain, its flags, stub/resolver guest addresses, and whether the resolver target is executable.

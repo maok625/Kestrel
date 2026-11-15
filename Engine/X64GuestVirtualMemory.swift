@@ -698,6 +698,53 @@ struct X64GuestVirtualMemory: Sendable {
         try writeBytes(data, at: address)
     }
 
+    /// Removes write access from every page/range that existed before an
+    /// isolated guest-execution snapshot was created. The VM value can share
+    /// committed page backing with its source, so speculative execution must
+    /// not be allowed to mutate those shared allocations.
+    ///
+    /// Callers may reserve and commit fresh writable pages after this method;
+    /// those pages belong only to the snapshot. The cached native page table is
+    /// invalidated so the JIT observes the tightened permissions.
+    @discardableResult
+    mutating func restrictExistingWritesForIsolatedExecution() -> Int {
+        var protectedPageCount = 0
+        var changed = false
+
+        // Mutating the dictionary detaches its value storage from any source
+        // VM copy. The page backing objects remain shared, but every such page
+        // is now non-writable in this snapshot before native code can access it.
+        for pageBase in Array(committedPages.keys) {
+            guard var page = committedPages[pageBase],
+                  page.permissions.contains(.write) else { continue }
+            page.permissions.remove(.write)
+            committedPages[pageBase] = page
+            protectedPageCount += 1
+            changed = true
+        }
+
+        // Also prevent a write from materializing a new writable page inside
+        // a demand-zero range that belonged to the source VM.
+        for index in demandZeroRanges.indices {
+            let range = demandZeroRanges[index]
+            guard range.permissions.contains(.write) else { continue }
+            var permissions = range.permissions
+            permissions.remove(.write)
+            demandZeroRanges[index] = X64GuestDemandZeroRange(
+                baseAddress: range.baseAddress,
+                byteCount: range.byteCount,
+                permissions: permissions
+            )
+            changed = true
+        }
+
+        if changed {
+            mappingGeneration &+= 1
+            nativePageTable = nil
+        }
+        return protectedPageCount
+    }
+
     func permissions(at address: UInt64) -> X64GuestMemoryPermissions? {
         let pageBase = address & ~(pageSize - 1)
         return committedPages[pageBase]?.permissions

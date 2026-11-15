@@ -337,6 +337,7 @@ struct X64ARM64DispatchReport: Sendable {
 enum X64ARM64DispatcherError: LocalizedError {
     case invalidLimits
     case systemCallRequiresSparseGuestVM
+    case systemCallNotAllowed(rip: UInt64)
     case emptyBlock(address: UInt64)
     case haltAddressNotInstructionBoundary(haltAddress: UInt64, instructionAddress: UInt64, instructionEnd: UInt64)
     case instructionExceedsBlockByteLimit(address: UInt64, instructionBytes: Int, maximumBytes: Int)
@@ -349,6 +350,8 @@ enum X64ARM64DispatcherError: LocalizedError {
             return "Dispatcher limits must be positive; maximum block bytes must be at least 15."
         case .systemCallRequiresSparseGuestVM:
             return "Darwin syscalls require the sparse guest virtual-memory dispatcher."
+        case .systemCallNotAllowed(let rip):
+            return String(format: "Guest syscall at return RIP 0x%016llX was rejected by isolated execution policy.", rip)
         case .emptyBlock(let address):
             return String(format: "The dispatcher could not construct a block at guest RIP 0x%016llX.", address)
         case .haltAddressNotInstructionBoundary(let haltAddress, let instructionAddress, let instructionEnd):
@@ -480,7 +483,8 @@ struct X64ARM64BlockDispatcher {
         maximumInstructions: Int = 100_000,
         maximumBlocks: Int = 100_000,
         syscallHost: any X64DarwinSyscallHost = X64ConsoleDarwinSyscallHost(),
-        hostThunks: X64DarwinHostThunkTable? = nil
+        hostThunks: X64DarwinHostThunkTable? = nil,
+        allowSystemCalls: Bool = true
     ) throws -> X64ARM64DispatchReport {
         guard maximumInstructions > 0, maximumBlocks > 0 else {
             throw X64ARM64DispatcherError.invalidLimits
@@ -534,6 +538,9 @@ struct X64ARM64BlockDispatcher {
                 instructionsExecuted += block.instructionCount
             case .systemCall:
                 instructionsExecuted += block.instructionCount
+                guard allowSystemCalls else {
+                    throw X64ARM64DispatcherError.systemCallNotAllowed(rip: state.rip)
+                }
                 // x86-64 SYSCALL saves the next guest RIP in RCX and the
                 // pre-entry RFLAGS image in R11. The Darwin syscall shim
                 // then writes the syscall result to RAX and uses CF for error.

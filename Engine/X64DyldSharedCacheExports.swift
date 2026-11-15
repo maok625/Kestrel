@@ -488,6 +488,189 @@ enum X64DyldDependencyRouteFinder {
     }
 }
 
+enum X64DyldLazyResolverProbeStatus: String, Sendable {
+    case returned
+    case memoryFault
+    case systemCallBlocked
+    case processExit
+    case executionFailed
+}
+
+struct X64DyldLazyResolverProbeResult: Sendable {
+    let resolverAddress: UInt64
+    let status: X64DyldLazyResolverProbeStatus
+    let returnedAddress: UInt64?
+    let returnedAddressIsMappedExecutable: Bool?
+    let instructionsExecuted: Int
+    let blocksExecuted: Int
+    let finalRIP: UInt64?
+    let detail: String?
+
+    static func failed(address: UInt64, detail: String) -> Self {
+        Self(
+            resolverAddress: address,
+            status: .executionFailed,
+            returnedAddress: nil,
+            returnedAddressIsMappedExecutable: nil,
+            instructionsExecuted: 0,
+            blocksExecuted: 0,
+            finalRIP: nil,
+            detail: detail
+        )
+    }
+}
+
+/// A reusable, bounded guest-only execution environment for inspecting dyld
+/// resolver functions. Existing VM pages are made read-only in a value-copy
+/// before native execution; the runner then allocates a private stack. Host
+/// thunks and syscalls are disabled. Successful return values are diagnostic
+/// candidates only and are not automatically used to bind imports.
+struct X64DyldLazyResolverProbeSession {
+    private static let stackBytes: UInt64 = 64 * 1_024
+    private static let stackMinimumAddress: UInt64 = 0x0000_6000_0000_0000
+    private static let stackMaximumAddress: UInt64 = 0x0000_7000_0000_0000
+    private static let maximumInstructions = 2_048
+    private static let maximumBlocks = 512
+
+    private var memory: X64GuestVirtualMemory
+    private var dispatcher = X64ARM64BlockDispatcher(cacheCapacity: 128)
+    private let stackBase: UInt64
+    private let stackPointer: UInt64
+    private let haltAddress: UInt64
+    let protectedPageCount: Int
+
+    init(sourceMemory: X64GuestVirtualMemory) throws {
+        var isolatedMemory = sourceMemory
+        protectedPageCount = isolatedMemory.restrictExistingWritesForIsolatedExecution()
+
+        let pageSize = isolatedMemory.pageSize
+        let guardBytes = pageSize.multipliedReportingOverflow(by: 2)
+        let totalBytes = Self.stackBytes.addingReportingOverflow(guardBytes.partialValue)
+        guard !guardBytes.overflow, !totalBytes.overflow else {
+            throw X64GuestVirtualMemoryFault(
+                address: Self.stackMinimumAddress,
+                byteCount: Int(Self.stackBytes),
+                access: .write,
+                reason: "isolated resolver stack range overflows"
+            )
+        }
+
+        let reservation = try isolatedMemory.reserveAnywhere(
+            byteCount: totalBytes.partialValue,
+            alignment: pageSize,
+            minimumAddress: Self.stackMinimumAddress,
+            maximumAddress: Self.stackMaximumAddress,
+            kind: .stack
+        )
+        let usableBase = reservation.baseAddress + pageSize
+        try isolatedMemory.commit(
+            at: usableBase,
+            byteCount: Self.stackBytes,
+            permissions: .readWrite
+        )
+
+        memory = isolatedMemory
+        stackBase = usableBase
+        // The top is 16-byte aligned; a guest CALL would push an 8-byte return
+        // address, so a resolver begins with the SysV-required RSP % 16 == 8.
+        stackPointer = usableBase + Self.stackBytes - 8
+        // The low guard page is a sentinel return address. The dispatcher halts
+        // on this RIP before attempting an instruction fetch from that page.
+        haltAddress = reservation.baseAddress
+    }
+
+    mutating func probe(address: UInt64, rdi: UInt64 = 0) -> X64DyldLazyResolverProbeResult {
+        guard memory.region(containing: address) != nil,
+              memory.permissions(at: address)?.contains(.execute) == true else {
+            return .failed(address: address, detail: "Resolver address is not mapped executable in the isolated guest VM.")
+        }
+
+        do {
+            // Reset the private stack for each resolver so probes do not depend
+            // on stale stack contents left by a previous function.
+            try memory.writeBytes(Array(repeating: 0, count: Int(Self.stackBytes)), at: stackBase)
+            try memory.writeUnsigned(haltAddress, at: stackPointer, byteCount: 8)
+
+            var state = X64CPUState(rip: address)
+            try state.writeRegister(.rsp, value: stackPointer, width: .qword)
+            try state.writeRegister(.rdi, value: rdi, width: .qword)
+
+            let report = try dispatcher.run(
+                state: &state,
+                memory: &memory,
+                until: haltAddress,
+                maximumInstructions: Self.maximumInstructions,
+                maximumBlocks: Self.maximumBlocks,
+                hostThunks: nil,
+                allowSystemCalls: false
+            )
+
+            switch report.exit {
+            case .halted:
+                let returnedAddress = state.registerValue(.rax)
+                let executable = memory.region(containing: returnedAddress) != nil
+                    && memory.permissions(at: returnedAddress)?.contains(.execute) == true
+                return X64DyldLazyResolverProbeResult(
+                    resolverAddress: address,
+                    status: .returned,
+                    returnedAddress: returnedAddress,
+                    returnedAddressIsMappedExecutable: executable,
+                    instructionsExecuted: report.instructionsExecuted,
+                    blocksExecuted: report.blocksExecuted,
+                    finalRIP: report.finalRIP,
+                    detail: nil
+                )
+
+            case .memoryFault(let faultingRIP):
+                return X64DyldLazyResolverProbeResult(
+                    resolverAddress: address,
+                    status: .memoryFault,
+                    returnedAddress: nil,
+                    returnedAddressIsMappedExecutable: nil,
+                    instructionsExecuted: report.instructionsExecuted,
+                    blocksExecuted: report.blocksExecuted,
+                    finalRIP: report.finalRIP,
+                    detail: String(format: "Guest memory fault at instruction RIP 0x%016llX.", faultingRIP)
+                )
+
+            case .processExit(let status):
+                return X64DyldLazyResolverProbeResult(
+                    resolverAddress: address,
+                    status: .processExit,
+                    returnedAddress: nil,
+                    returnedAddressIsMappedExecutable: nil,
+                    instructionsExecuted: report.instructionsExecuted,
+                    blocksExecuted: report.blocksExecuted,
+                    finalRIP: report.finalRIP,
+                    detail: "Guest resolver attempted process exit with status \(status)."
+                )
+            }
+        } catch X64ARM64DispatcherError.systemCallNotAllowed(let rip) {
+            return X64DyldLazyResolverProbeResult(
+                resolverAddress: address,
+                status: .systemCallBlocked,
+                returnedAddress: nil,
+                returnedAddressIsMappedExecutable: nil,
+                instructionsExecuted: 0,
+                blocksExecuted: 0,
+                finalRIP: rip,
+                detail: String(format: "Guest syscall rejected at return RIP 0x%016llX.", rip)
+            )
+        } catch {
+            return X64DyldLazyResolverProbeResult(
+                resolverAddress: address,
+                status: .executionFailed,
+                returnedAddress: nil,
+                returnedAddressIsMappedExecutable: nil,
+                instructionsExecuted: 0,
+                blocksExecuted: 0,
+                finalRIP: nil,
+                detail: error.localizedDescription
+            )
+        }
+    }
+}
+
 struct X64DyldSharedCacheImportResolutionSummary: Sendable {
     let resolver: X64MachOSymbolResolver
     let examinedImageCount: Int
@@ -504,6 +687,8 @@ struct X64DyldSharedCacheImportResolutionSummary: Sendable {
     let ambiguousWeakLookupSymbols: [String]
     let candidateProvidersBySymbol: [String: [String]]
     let unresolvedBindingDiagnostics: [X64DyldUnresolvedBindingDiagnostic]
+    let lazyResolverProbeResults: [X64DyldLazyResolverProbeResult]
+    let lazyResolverProtectedPageCount: Int
     let unresolvedByDependency: [String: Int]
     let resolvedByDependency: [String: Int]
 }
@@ -980,6 +1165,29 @@ enum X64DyldSharedCacheImportResolver {
             ))
         }
 
+        // Probe each unique executable resolver address once in a single
+        // isolated VM snapshot. Results are diagnostics only: dyld startup,
+        // TLS and process initialization are not yet available, so even a
+        // successful return must not be treated as a binding decision.
+        let resolverAddresses = Array(Set(unresolvedBindingDiagnostics.compactMap {
+            $0.candidateResolverIsExecutable == true ? $0.candidateResolverAddress : nil
+        })).sorted()
+        var lazyResolverProbeResults: [X64DyldLazyResolverProbeResult] = []
+        var lazyResolverProtectedPageCount = 0
+        if !resolverAddresses.isEmpty {
+            do {
+                var probeSession = try X64DyldLazyResolverProbeSession(sourceMemory: guestMemory)
+                lazyResolverProtectedPageCount = probeSession.protectedPageCount
+                for address in resolverAddresses {
+                    lazyResolverProbeResults.append(probeSession.probe(address: address))
+                }
+            } catch {
+                lazyResolverProbeResults = resolverAddresses.map {
+                    .failed(address: $0, detail: "Could not create isolated resolver VM: \(error.localizedDescription)")
+                }
+            }
+        }
+
         return X64DyldSharedCacheImportResolutionSummary(
             resolver: resolver,
             examinedImageCount: metadataByPath.count,
@@ -996,6 +1204,8 @@ enum X64DyldSharedCacheImportResolver {
             ambiguousWeakLookupSymbols: ambiguousWeakLookupSymbols.sorted(),
             candidateProvidersBySymbol: candidateProvidersBySymbol,
             unresolvedBindingDiagnostics: unresolvedBindingDiagnostics,
+            lazyResolverProbeResults: lazyResolverProbeResults,
+            lazyResolverProtectedPageCount: lazyResolverProtectedPageCount,
             unresolvedByDependency: unresolvedByDependency.mapValues(\.count),
             resolvedByDependency: resolvedByDependency
         )

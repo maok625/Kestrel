@@ -1,3 +1,12 @@
+## 0.24.0 — bounded isolated dyld resolver probes
+
+- Add a reusable isolated guest-execution session for mapped lazy resolver functions, with hard instruction and block budgets.
+- Protect all pre-existing committed pages and demand-zero ranges against writes in the copied VM; allocate a separate private guest stack for calls.
+- Reject syscalls and disable host-thunk dispatch. Record resolver return values and whether RAX points to mapped executable guest memory.
+- Keep all probe results diagnostic-only; no import is rebound from speculative resolver execution before dyld initialization and TLS are available.
+- Add regressions for normal return, blocked writes/source-memory integrity, and syscall rejection.
+- Full Xcode build and live M4 validation remain outstanding.
+
 ## 0.23.0 — expose lazy resolver targets in unresolved-bind diagnostics
 
 - Preserve the exact provider export reached through the declared dependency's LC_REEXPORT_DYLIB chain for each unresolved binding.

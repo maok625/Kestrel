@@ -38,6 +38,15 @@ enum X64ARM64DispatcherSelfTests {
         try verifyMemoryFaultStopsDispatch()
         passed.append("Native guest-memory fault is surfaced to the dispatcher without advancing faulting RIP")
 
+        try verifyIsolatedResolverReturn()
+        passed.append("Isolated resolver probe executes a bounded guest function and captures its RAX return value")
+
+        try verifyIsolatedResolverWriteProtection()
+        passed.append("Isolated resolver probe rejects writes to shared guest pages without changing source memory")
+
+        try verifyIsolatedResolverSyscallRejection()
+        passed.append("Isolated resolver probe rejects guest syscalls before any host syscall or thunk is invoked")
+
         try verifyBlockCacheCapacity()
         passed.append("Translation cache enforces its configured entry capacity with LRU eviction")
         return passed
@@ -190,6 +199,72 @@ enum X64ARM64DispatcherSelfTests {
               state.rip == guestBase else {
             throw TestError.failed("memory fault should stop dispatch at the faulting guest instruction")
         }
+    }
+
+    private static func verifyIsolatedResolverReturn() throws {
+        let memory = try makeExecutableVirtualMemory(
+            code: [
+                0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+                0xC3                          // ret
+            ]
+        )
+        var session = try X64DyldLazyResolverProbeSession(sourceMemory: memory)
+        let result = session.probe(address: guestBase)
+
+        guard result.status == .returned,
+              result.returnedAddress == 42,
+              result.instructionsExecuted == 2,
+              result.returnedAddressIsMappedExecutable == false else {
+            throw TestError.failed("isolated resolver return expected RAX=42; got status=\(result.status.rawValue), RAX=\(String(describing: result.returnedAddress))")
+        }
+        guard memory.permissions(at: guestBase)?.contains(.execute) == true else {
+            throw TestError.failed("isolated resolver probe changed source code permissions")
+        }
+    }
+
+    private static func verifyIsolatedResolverWriteProtection() throws {
+        var memory = try makeExecutableVirtualMemory(code: [
+            0x48, 0x89, 0x07, // mov [rdi], rax
+            0xC3              // ret
+        ])
+        let dataAddress = guestBase + 0x2000
+        try memory.reserve(at: dataAddress, byteCount: 0x1000, kind: .anonymous)
+        try memory.commit(at: dataAddress, byteCount: 0x1000, permissions: .readWrite)
+        let originalValue: UInt64 = 0x1122_3344_5566_7788
+        try memory.writeUnsigned(originalValue, at: dataAddress, byteCount: 8)
+
+        var session = try X64DyldLazyResolverProbeSession(sourceMemory: memory)
+        let result = session.probe(address: guestBase, rdi: dataAddress)
+
+        guard result.status == .memoryFault else {
+            throw TestError.failed("isolated resolver write should fault, got status=\(result.status.rawValue)")
+        }
+        guard try memory.readUnsigned(at: dataAddress, byteCount: 8) == originalValue,
+              memory.permissions(at: dataAddress)?.contains(.write) == true else {
+            throw TestError.failed("isolated resolver write changed source data or its permissions")
+        }
+    }
+
+    private static func verifyIsolatedResolverSyscallRejection() throws {
+        let memory = try makeExecutableVirtualMemory(code: [
+            0x0F, 0x05, // syscall
+            0xC3        // ret (must not be reached)
+        ])
+        var session = try X64DyldLazyResolverProbeSession(sourceMemory: memory)
+        let result = session.probe(address: guestBase)
+
+        guard result.status == .systemCallBlocked else {
+            throw TestError.failed("isolated resolver syscall should be rejected, got status=\(result.status.rawValue)")
+        }
+    }
+
+    private static func makeExecutableVirtualMemory(code: [UInt8]) throws -> X64GuestVirtualMemory {
+        var memory = try X64GuestVirtualMemory()
+        try memory.reserve(at: guestBase, byteCount: 0x1000, kind: .image)
+        try memory.commit(at: guestBase, byteCount: 0x1000, permissions: .readWrite)
+        try memory.writeBytes(code, at: guestBase)
+        try memory.protect(at: guestBase, byteCount: 0x1000, permissions: .readExecute)
+        return memory
     }
 
     private static func verifyBlockCacheCapacity() throws {
