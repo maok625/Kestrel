@@ -152,6 +152,130 @@ enum X64DarwinRuntimeSelfTests {
             passed.append("Explicit Darwin C ABI thunk descriptors define argument registers and guest-pointer translation requirements")
         }
 
+        do {
+            var memory = try X64GuestVirtualMemory()
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: 0x1_0000_1000,
+                mainMachHeaderAddress: 0x1_0000_0000,
+                executablePath: "/tmp/freestanding",
+                arguments: ["--mode", "two words"],
+                environment: ["MODE": "test"],
+                into: &memory,
+                usableStackSize: 64 * 1024
+            )
+            var state = X64CPUState()
+            try startup.installDirectMainEntry(into: &state, memory: &memory)
+            try expect(state.rip == startup.entryPoint, "direct-main RIP")
+            try expect(state.registerValue(.rdi) == 4, "main argc includes argv[0]")
+            try expect(state.registerValue(.rsi) == startup.argvPointer, "main argv register")
+            try expect(state.registerValue(.rdx) == startup.envpPointer, "main envp register")
+            try expect(state.registerValue(.rsp) % 16 == 8, "SysV callee-entry stack alignment")
+            try expect(
+                try memory.readUnsigned(at: state.registerValue(.rsp), byteCount: 8) == startup.stackReservation.baseAddress,
+                "direct-main return sentinel"
+            )
+            passed.append("Direct LC_MAIN handoff installs the x86_64 main(argc, argv, envp) registers and CALL-compatible stack frame")
+        }
+
+        do {
+            let image = try X64MachOParser.parse(data: X64MachOLoaderSelfTests.makeFreestandingMainExecutable(
+                code: [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3] // mov eax, 42; ret
+            ))
+            var memory = try X64GuestVirtualMemory()
+            let loaded = try X64MachOLoader.load(image, into: &memory)
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: loaded.entryAddress,
+                mainMachHeaderAddress: loaded.preferredLoadAddress,
+                executablePath: image.sourceName,
+                arguments: [],
+                environment: [:],
+                into: &memory,
+                usableStackSize: 64 * 1024
+            )
+            let result = try X64GuestDirectMainLauncher.launch(
+                image: image,
+                loadedImage: loaded,
+                startup: startup,
+                memory: &memory,
+                maximumInstructions: 100,
+                maximumBlocks: 100
+            )
+            try expect(result.report.exit == .halted, "direct-main returns through its sentinel")
+            try expect(result.returnedFromMain && result.exitStatus == 42, "main return value becomes process status")
+            try expect(result.report.instructionsExecuted == 2, "two guest instructions executed natively")
+            passed.append("Freestanding x86_64 Mach-O loads, enters LC_MAIN through native AArch64 blocks, returns, and reports the C main status")
+        }
+
+        do {
+            // mov eax, SYS_write; mov edi, 1; lea rsi, [rip+13]; mov edx, 2;
+            // syscall; mov eax, 0; ret; "OK".
+            let code: [UInt8] = [
+                0xB8, 0x04, 0x00, 0x00, 0x02,
+                0xBF, 0x01, 0x00, 0x00, 0x00,
+                0x48, 0x8D, 0x35, 0x0D, 0x00, 0x00, 0x00,
+                0xBA, 0x02, 0x00, 0x00, 0x00,
+                0x0F, 0x05,
+                0xB8, 0x00, 0x00, 0x00, 0x00,
+                0xC3,
+                0x4F, 0x4B
+            ]
+            let image = try X64MachOParser.parse(data: X64MachOLoaderSelfTests.makeFreestandingMainExecutable(code: code))
+            var memory = try X64GuestVirtualMemory()
+            let loaded = try X64MachOLoader.load(image, into: &memory)
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: loaded.entryAddress,
+                mainMachHeaderAddress: loaded.preferredLoadAddress,
+                executablePath: image.sourceName,
+                arguments: [],
+                environment: [:],
+                into: &memory,
+                usableStackSize: 64 * 1024
+            )
+            let host = MockHost()
+            let result = try X64GuestDirectMainLauncher.launch(
+                image: image,
+                loadedImage: loaded,
+                startup: startup,
+                memory: &memory,
+                syscallHost: host,
+                maximumInstructions: 100,
+                maximumBlocks: 100
+            )
+            try expect(host.output == [0x4F, 0x4B], "guest write syscall reaches host stdout")
+            try expect(result.report.exit == .halted && result.exitStatus == 0, "guest main returns after host write")
+            passed.append("Launched x86_64 guest code executes Darwin SYS_write through the host bridge and returns normally")
+        }
+
+        do {
+            let image = try X64MachOParser.parse(data: X64MachOLoaderSelfTests.makeBoundThinExecutable())
+            var memory = try X64GuestVirtualMemory()
+            let loaded = try X64MachOLoader.load(image, into: &memory)
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: loaded.entryAddress,
+                mainMachHeaderAddress: loaded.preferredLoadAddress,
+                executablePath: image.sourceName,
+                arguments: [],
+                environment: [:],
+                into: &memory,
+                usableStackSize: 64 * 1024
+            )
+            var blocked = false
+            do {
+                _ = try X64GuestDirectMainLauncher.launch(
+                    image: image,
+                    loadedImage: loaded,
+                    startup: startup,
+                    memory: &memory,
+                    maximumInstructions: 100,
+                    maximumBlocks: 100
+                )
+            } catch {
+                blocked = error.localizedDescription.contains("bypasses dyld")
+            }
+            try expect(blocked, "normal dylib-dependent image is rejected before guest execution")
+            passed.append("Direct-main mode fails closed for an executable with LC_LOAD_DYLIB dependencies instead of pretending dyld ran")
+        }
+
         return passed
     }
 

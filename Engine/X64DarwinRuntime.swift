@@ -180,6 +180,107 @@ extension X64GuestProcessStartupState {
         try state.writeRegister(.rsp, value: stackPointer, width: .qword)
         try state.writeRegister(.rbp, value: 0, width: .qword)
     }
+
+    /// Installs a direct C main(argc, argv, envp) call frame. This is not the
+    /// kernel-to-dyld entry contract above; it is used only by Kestrel's
+    /// restricted no-dyld launch mode.
+    func installDirectMainEntry(
+        into state: inout X64CPUState,
+        memory: inout X64GuestVirtualMemory
+    ) throws {
+        let entryStack = stackPointer.subtractingReportingOverflow(8)
+        guard !entryStack.overflow,
+              entryStack.partialValue >= usableStackBase,
+              entryStack.partialValue % 16 == 8 else {
+            throw X64GuestProcessStartupError.stackOverflow
+        }
+
+        // A normal x86_64 CALL leaves its return address at [RSP] and the
+        // callee observes RSP % 16 == 8. The guard page is the return sentinel;
+        // the dispatcher halts before attempting to fetch from it.
+        try memory.writeUnsigned(stackReservation.baseAddress, at: entryStack.partialValue, byteCount: 8)
+
+        var mainState = X64CPUState(rip: entryPoint)
+        try mainState.writeRegister(.rsp, value: entryStack.partialValue, width: .qword)
+        try mainState.writeRegister(.rbp, value: 0, width: .qword)
+        try mainState.writeRegister(.rdi, value: UInt64(argumentCount), width: .qword)
+        try mainState.writeRegister(.rsi, value: argvPointer, width: .qword)
+        try mainState.writeRegister(.rdx, value: envpPointer, width: .qword)
+        state = mainState
+    }
+}
+
+struct X64GuestDirectMainLaunchResult: Sendable {
+    let report: X64ARM64DispatchReport
+    /// C main's RAX result, or the explicit status passed to exit/_exit.
+    /// Nil means execution stopped on a guest memory fault.
+    let exitStatus: Int32?
+    let returnedFromMain: Bool
+}
+
+/// Minimal end-to-end guest launcher for freestanding x86_64 MH_EXECUTE files.
+/// It calls LC_MAIN as C main(argc, argv, envp) and deliberately bypasses
+/// dyld. Normal macOS executables with dependencies, bind actions, or chained
+/// fixups are rejected until the real dyld startup path exists.
+enum X64GuestDirectMainLauncher {
+    static let defaultMaximumInstructions = 5_000_000
+    static let defaultMaximumBlocks = 500_000
+
+    static func launch(
+        image: X64MachOImage,
+        loadedImage: X64MachOLoadedImage,
+        startup: X64GuestProcessStartupState,
+        memory: inout X64GuestVirtualMemory,
+        hostThunks: X64DarwinHostThunkTable? = nil,
+        syscallHost: any X64DarwinSyscallHost = X64ConsoleDarwinSyscallHost(),
+        maximumInstructions: Int = defaultMaximumInstructions,
+        maximumBlocks: Int = defaultMaximumBlocks
+    ) throws -> X64GuestDirectMainLaunchResult {
+        guard image.dependencies.isEmpty else {
+            let preview = image.dependencies.prefix(3).map(\.installName).joined(separator: ", ")
+            throw X64MachOFormatError(message: "Direct-main launch bypasses dyld and cannot load LC_LOAD_DYLIB dependencies (\(image.dependencies.count); e.g. \(preview)).")
+        }
+        guard image.bindActions.isEmpty, image.weakBindActions.isEmpty, image.lazyBindActions.isEmpty,
+              loadedImage.unresolvedBindFixupCount == 0 else {
+            throw X64MachOFormatError(message: "Direct-main launch requires an image with no dyld import-bind actions.")
+        }
+        guard image.chainedFixupsBytes == 0, loadedImage.unresolvedChainedFixupsBytes == 0 else {
+            throw X64MachOFormatError(message: "Direct-main launch does not support LC_DYLD_CHAINED_FIXUPS.")
+        }
+        guard startup.entryPoint == loadedImage.entryAddress else {
+            throw X64MachOFormatError(message: "Guest startup entry point does not match the loaded Mach-O LC_MAIN address.")
+        }
+        guard memory.permissions(at: loadedImage.entryAddress)?.contains(.execute) == true else {
+            throw X64MachOFormatError(message: "Loaded LC_MAIN entry point is not executable in guest memory.")
+        }
+
+        var state = X64CPUState()
+        try startup.installDirectMainEntry(into: &state, memory: &memory)
+        var dispatcher = X64ARM64BlockDispatcher()
+        let report = try dispatcher.run(
+            state: &state,
+            memory: &memory,
+            until: startup.stackReservation.baseAddress,
+            maximumInstructions: maximumInstructions,
+            maximumBlocks: maximumBlocks,
+            syscallHost: syscallHost,
+            hostThunks: hostThunks,
+            allowSystemCalls: true
+        )
+
+        switch report.exit {
+        case .halted:
+            return X64GuestDirectMainLaunchResult(
+                report: report,
+                exitStatus: Int32(truncatingIfNeeded: state.registerValue(.rax)),
+                returnedFromMain: true
+            )
+        case .processExit(let status):
+            return X64GuestDirectMainLaunchResult(report: report, exitStatus: status, returnedFromMain: false)
+        case .memoryFault:
+            return X64GuestDirectMainLaunchResult(report: report, exitStatus: nil, returnedFromMain: false)
+        }
+    }
 }
 
 // MARK: - Darwin x86_64 syscall ABI subset

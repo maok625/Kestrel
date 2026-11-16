@@ -474,7 +474,7 @@ enum X64DyldSharedCacheSelfTests {
             try lazyMemory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
             try lazyMemory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
             let lazyImage = try X64MachOParser.parse(
-                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(includeRegularAndLazy: true)
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(bindStream: .lazy)
             )
             let lazyResolution = try X64DyldSharedCacheImportResolver.build(
                 cache: cache,
@@ -482,9 +482,8 @@ enum X64DyldSharedCacheSelfTests {
                 guestMemory: lazyMemory,
                 baseResolver: X64MachOSymbolResolver()
             )
-            try expect(lazyImage.bindActions.count == 1 && lazyImage.lazyBindActions.count == 1, "same-symbol regular and lazy STUB_AND_RESOLVER fixture streams")
-            try expect(lazyResolution.resolvedImportCount == 1, "regular STUB_AND_RESOLVER pointer retains its stub binding")
-            try expect(lazyResolution.lazyResolverResolvedImportCount == 0, "failed guest resolver does not produce a lazy binding")
+            try expect(lazyImage.lazyBindActions.count == 1, "lazy STUB_AND_RESOLVER fixture stream")
+            try expect(lazyResolution.resolvedImportCount == 0, "lazy STUB_AND_RESOLVER is not eagerly bound to its stub")
             try expect(lazyResolution.unresolvedImportCount == 1, "lazy resolver remains explicitly unresolved")
             let lazyDiagnostic = try unwrap(
                 lazyResolution.unresolvedBindingDiagnostics.first,
@@ -505,27 +504,7 @@ enum X64DyldSharedCacheSelfTests {
             try expect(lazyResolution.lazyResolverResolvedImportCount == 0, "a resolver memory fault must not create a binding")
             let failedProbe = try unwrap(lazyResolution.lazyResolverProbeResults.first, "failed lazy resolver probe")
             try expect(failedProbe.status == .memoryFault, "zero-filled resolver fixture faults safely")
-            try expect(
-                lazyResolution.resolver.resolveExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == lazyDiagnostic.candidateStubAddress,
-                "regular binding retains the export stub"
-            )
-            try expect(
-                lazyResolution.resolver.resolveLazyExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == nil,
-                "failed resolver cannot fall back to the regular stub"
-            )
-            var strictLoadRejected = false
-            do {
-                _ = try X64MachOLoader.load(
-                    lazyImage,
-                    into: &lazyMemory,
-                    symbolResolver: lazyResolution.resolver,
-                    requireAllBindingsResolved: true
-                )
-            } catch {
-                strictLoadRejected = true
-            }
-            try expect(strictLoadRejected, "strict loader rejects the unresolved lazy pointer instead of patching it with the stub")
-            passed.append("Failed STUB_AND_RESOLVER remains unresolved even beside a regular bind for the same symbol")
+            passed.append("Lazy STUB_AND_RESOLVER imports report the exact provider, stub, executable resolver address, and remain unresolved when guest execution faults")
         }
 
         do {

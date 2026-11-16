@@ -583,6 +583,13 @@ enum X64MachOLoaderSelfTests {
 
     // MARK: Fixture construction
 
+    static func makeFreestandingMainExecutable(code: [UInt8]) -> Data {
+        precondition(!code.isEmpty && code.count <= 0x1000 - Int(entryOffset))
+        var data = makeThinExecutable()
+        data.replaceSubrange(Int(entryOffset)..<(Int(entryOffset) + code.count), with: code)
+        return data
+    }
+
     private static func makeThinExecutable() -> Data {
         var data = Data()
         appendLE32(0xFEED_FACF, to: &data)       // MH_MAGIC_64
