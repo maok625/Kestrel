@@ -1146,6 +1146,8 @@ struct X64MachOSymbolResolver: Sendable {
     private(set) var addresses: [String: UInt64] = [:]
     /// Resolver-returned implementations override ordinary exports only for lazy-bind actions.
     private(set) var lazyAddresses: [String: UInt64] = [:]
+    /// Keys for lazy STUB_AND_RESOLVER exports must never fall back to the ordinary stub.
+    private var lazyResolverRequiredKeys: Set<String> = []
     /// Weak definitions occupy a separate namespace so BIND_SPECIAL_DYLIB_WEAK_LOOKUP
     /// cannot accidentally accept an ordinary strong export or a host ABI thunk.
     private(set) var weakAddresses: [String: UInt64] = [:]
@@ -1163,6 +1165,10 @@ struct X64MachOSymbolResolver: Sendable {
 
     mutating func registerLazy(symbol: String, address: UInt64, installName: String? = nil) {
         lazyAddresses[key(symbol: symbol, installName: installName)] = address
+    }
+
+    mutating func requireLazyResolverImplementation(symbol: String, installName: String? = nil) {
+        lazyResolverRequiredKeys.insert(key(symbol: symbol, installName: installName))
     }
 
     mutating func registerWeak(symbol: String, address: UInt64, installName: String? = nil) {
@@ -1190,19 +1196,26 @@ struct X64MachOSymbolResolver: Sendable {
     /// the ordinary export (the stub for STUB_AND_RESOLVER).
     func resolveLazyExact(symbol: String, installName: String) -> UInt64? {
         let lookupKey = key(symbol: symbol, installName: installName)
+        if lazyResolverRequiredKeys.contains(lookupKey) {
+            return lazyAddresses[lookupKey]
+        }
         return lazyAddresses[lookupKey] ?? addresses[lookupKey]
     }
 
     func resolveLazy(symbol: String, dependency: X64MachODylibDependency? = nil) -> UInt64? {
-        if let dependency,
-           let exact = lazyAddresses[key(symbol: symbol, installName: dependency.installName)] {
-            return exact
-        }
-        if let dependency,
-           let exact = addresses[key(symbol: symbol, installName: dependency.installName)] {
-            return exact
+        if let dependency {
+            let exactKey = key(symbol: symbol, installName: dependency.installName)
+            if lazyResolverRequiredKeys.contains(exactKey) {
+                return lazyAddresses[exactKey]
+            }
+            if let exact = lazyAddresses[exactKey] ?? addresses[exactKey] {
+                return exact
+            }
         }
         let globalKey = key(symbol: symbol, installName: nil)
+        if lazyResolverRequiredKeys.contains(globalKey) {
+            return lazyAddresses[globalKey]
+        }
         return lazyAddresses[globalKey] ?? addresses[globalKey]
     }
 

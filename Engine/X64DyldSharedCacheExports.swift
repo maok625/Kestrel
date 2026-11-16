@@ -1173,6 +1173,19 @@ enum X64DyldSharedCacheImportResolver {
             ))
         }
 
+        // A STUB_AND_RESOLVER lazy import must not fall back to the regular
+        // export stub if probing fails (including when a regular bind for the
+        // same symbol has already registered that stub).
+        for diagnostic in unresolvedBindingDiagnostics
+        where diagnostic.resolutionBlocker == .lazyResolverExecutionRequired
+            && diagnostic.stream == X64MachOBindStreamKind.lazy.rawValue {
+            guard let dependency = diagnostic.dependencyInstallName else { continue }
+            resolver.requireLazyResolverImplementation(
+                symbol: diagnostic.symbolName,
+                installName: dependency
+            )
+        }
+
         // Probe each unique executable resolver address once in a single
         // isolated VM snapshot. Only a result that points to executable guest
         // memory may satisfy its declared two-level lazy import.
