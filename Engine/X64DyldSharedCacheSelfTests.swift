@@ -17,6 +17,31 @@ enum X64DyldSharedCacheSelfTests {
         }
 
         do {
+            let url = try makeCacheFileWithDylinker()
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            let dyld = try unwrap(X64DyldSharedCacheDylinkerReader.find(in: cache), "x86_64 MH_DYLINKER discovery")
+            try expect(dyld.installName == "/usr/lib/dyld", "canonical dyld install name")
+            try expect(dyld.machHeaderAddress == 0x7FFF_0000_0000, "dyld mach_header address")
+            try expect(dyld.entryPoint == 0x7FFF_0000_0100, "LC_UNIXTHREAD x86_64 RIP entrypoint")
+            try expect(dyld.executableSegments.contains(where: { dyld.entryPoint >= $0.lowerBound && dyld.entryPoint < $0.upperBound }), "dyld entry is inside executable segment")
+
+            let syntheticDependency = X64MachODylibDependency(
+                ordinal: 1,
+                installName: dyld.installName,
+                timestamp: 0,
+                currentVersion: 0,
+                compatibilityVersion: 0,
+                kind: .load
+            )
+            let plan = try X64DyldSharedCacheImageMapper.makePlan(cache: cache, dependencies: [syntheticDependency])
+            try expect(plan.images.count == 1, "dyld image receives a shared-cache mapping plan")
+            try expect(plan.images[0].machHeaderAddress == dyld.machHeaderAddress, "dyld mapping plan uses the discovered image header")
+            try expect(plan.executableSegmentCount == 1, "dyld executable segment is mapped")
+            passed.append("x86_64 MH_DYLINKER is discovered, its LC_UNIXTHREAD RIP is validated, and its pages can be planned for guest mapping")
+        }
+
+        do {
             let url = try makeCacheFile()
             defer { try? FileManager.default.removeItem(at: url) }
             let cache = try X64DyldSharedCacheReader.open(url)
@@ -1104,6 +1129,27 @@ enum X64DyldSharedCacheSelfTests {
         }
         data.writeLE32(UInt32(trie.count), at: cursor + 12)
         data.replaceSubrange(0x2000..<(0x2000 + trie.count), with: trie)
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    private static func makeCacheFileWithDylinker() throws -> URL {
+        let url = try makeCacheFile()
+        var data = try Data(contentsOf: url)
+        let base: UInt64 = 0x7FFF_0000_0000
+        writeImageInfo(&data, offset: 0x500, address: base, pathOffset: 0x700, path: "/usr/lib/dyld")
+
+        let header = 0x1000
+        data.writeLE32(0x7, at: header + 12) // MH_DYLINKER
+        data.writeLE32(2, at: header + 16) // LC_SEGMENT_64 + LC_UNIXTHREAD
+        data.writeLE32(72 + 184, at: header + 20)
+        let thread = header + 32 + 72
+        data.writeLE32(0x5, at: thread) // LC_UNIXTHREAD
+        data.writeLE32(184, at: thread + 4)
+        data.writeLE32(4, at: thread + 8) // x86_THREAD_STATE64
+        data.writeLE32(42, at: thread + 12) // 42 32-bit words
+        data.writeLE64(base + 0x100, at: thread + 16 + 16 * 8) // RIP
+
         try data.write(to: url, options: .atomic)
         return url
     }

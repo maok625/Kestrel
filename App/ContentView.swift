@@ -173,6 +173,10 @@ struct ContentView: View {
         GroupBox("x86_64 guest pipeline (experimental)") {
             VStack(alignment: .leading, spacing: 10) {
                 LazyVGrid(columns: pipelineColumns, alignment: .leading, spacing: 8) {
+                    pipelineButton("Run x86_64 guest via dyld", "play.circle",
+                                   enabled: model.canLaunchX64GuestViaDyld, action: model.launchSelectedX64GuestViaDyld)
+                    pipelineButton("Continue into x86_64 program", "gamecontroller",
+                                   enabled: model.canContinueX64GuestAfterDyld, action: model.continueSelectedX64GuestAfterDyld)
                     pipelineButton("Run x86_64 guest (direct main)", "play.fill",
                                    enabled: model.canLaunchX64Guest, action: model.launchSelectedX64Guest)
                     pipelineButton("1. Load selected x86_64 Mach-O image", "shippingbox",
@@ -188,10 +192,10 @@ struct ContentView: View {
                     pipelineButton("6. Prepare Darwin KernelArgs stack", "rectangle.stack",
                                    enabled: model.canPrepareGuestProcessStartup, action: model.prepareGuestProcessStartup)
                 }
-                Text("Kestrel now has an experimental x86_64 direct-main runner: it builds a C main(argc, argv, envp) frame and executes supported guest blocks through native AArch64 translation, including a small Darwin syscall bridge. This first launch mode is deliberately limited to freestanding MH_EXECUTE images with no dylib dependencies, bind actions or chained fixups; it bypasses dyld and does not run initializers. Normal macOS applications still require the real dyld entrypoint, uncached/@rpath image loading, chained fixups, runtime initialization, TLS/errno, broader syscalls and framework ABI support.")
+                Text("The dyld path now locates the x86_64 MH_DYLINKER in the Rosetta cache, maps its executable pages with the recursive dependency closure, supplies dyld_path in KernelArgs and attempts the real __dyld_start entry. It stops at the main executable's LC_MAIN handoff so you can inspect whether dyld initialized successfully, then offers a separate bounded continuation into the actual program. The direct-main button remains only for freestanding test executables. KytyPS5 will still need missing syscalls, instructions, uncached/@rpath images and framework ABI support as the first real run exposes them.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Load the x86_64 image before using guest launch or steps 2–6. Guest launch currently rejects ordinary dependency-linked macOS applications with an explicit dyld blocker; steps 2–5 remain the separate cache preparation and import-resolution path.")
+                Text("For the normal launch path: load the executable, inspect the Rosetta cache, analyze and materialize the recursive closure (including /usr/lib/dyld), then prepare KernelArgs. Import resolution remains available as a diagnostic/prebinding step; dyld is intended to perform the executable’s own fixups when it starts.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

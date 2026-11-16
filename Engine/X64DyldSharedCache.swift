@@ -804,6 +804,239 @@ enum X64DyldSharedCacheError: LocalizedError {
     }
 }
 
+// MARK: - x86_64 dyld image and __dyld_start discovery
+
+struct X64DyldSharedCacheDylinkerEntry: Sendable, Equatable {
+    let installName: String
+    let machHeaderAddress: UInt64
+    let entryPoint: UInt64
+    let executableSegments: [Range<UInt64>]
+}
+
+/// Finds the real x86_64 dynamic linker in the Rosetta shared cache and reads
+/// its kernel entrypoint. LC_UNIXTHREAD's x86_THREAD_STATE64.rip is the
+/// preferred source; LC_MAIN is accepted only as a validated fallback.
+enum X64DyldSharedCacheDylinkerReader {
+    private static let machMagic64: UInt32 = 0xFEED_FACF
+    private static let cpuTypeX86_64: UInt32 = 0x0100_0007
+    private static let fileTypeDylinker: UInt32 = 0x7
+    private static let lcUnixThread: UInt32 = 0x5
+    private static let lcSegment64: UInt32 = 0x19
+    private static let lcMain: UInt32 = 0x8000_0028
+    private static let x86ThreadState64Flavor: UInt32 = 4
+    private static let x86ThreadState64WordCount: UInt32 = 42
+    private static let x86ThreadState64RIPIndex = 16
+    private static let machHeaderSize = 32
+    private static let segmentCommandSize = 72
+    private static let maximumLoadCommands: UInt32 = 65_536
+    private static let maximumCommandBytes: UInt32 = 16 * 1024 * 1024
+
+    private struct Segment {
+        let name: String
+        let virtualAddress: UInt64
+        let virtualSize: UInt64
+        let fileOffset: UInt64
+        let fileSize: UInt64
+        let initialProtection: UInt32
+
+        var virtualEnd: UInt64 { virtualAddress + virtualSize }
+        var fileEnd: UInt64 { fileOffset + fileSize }
+        var isExecutable: Bool { (initialProtection & 0x4) != 0 }
+    }
+
+    static func find(in cache: X64DyldSharedCacheSummary) throws -> X64DyldSharedCacheDylinkerEntry? {
+        let candidates = cache.images.filter {
+            $0.hasReadableX86_64Header && $0.fileType == fileTypeDylinker
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        let canonical = candidates.filter { $0.installName == "/usr/lib/dyld" }
+        let selected: X64DyldSharedCacheImageRecord
+        if canonical.count == 1, let image = canonical.first {
+            selected = image
+        } else if canonical.count > 1 {
+            throw X64DyldSharedCacheError.malformed("The x86_64 shared cache contains multiple /usr/lib/dyld image records.")
+        } else if candidates.count == 1, let image = candidates.first {
+            selected = image
+        } else {
+            let names = candidates.prefix(8).map(\.installName).joined(separator: ", ")
+            throw X64DyldSharedCacheError.malformed("The x86_64 shared cache contains multiple MH_DYLINKER candidates and none is the canonical /usr/lib/dyld image: \(names).")
+        }
+
+        return try parse(cache: cache, image: selected)
+    }
+
+    private static func parse(
+        cache: X64DyldSharedCacheSummary,
+        image: X64DyldSharedCacheImageRecord
+    ) throws -> X64DyldSharedCacheDylinkerEntry {
+        let header = try cache.readVMBytes(atVMAddress: image.machHeaderAddress, count: machHeaderSize)
+        guard readLE32(header, 0) == machMagic64,
+              readLE32(header, 4) == cpuTypeX86_64,
+              readLE32(header, 12) == fileTypeDylinker else {
+            throw X64DyldSharedCacheError.malformed("Cached dynamic linker \(image.installName) has an invalid x86_64 MH_DYLINKER header.")
+        }
+
+        let commandCount = readLE32(header, 16)
+        let commandBytes = readLE32(header, 20)
+        guard commandCount <= maximumLoadCommands, commandBytes <= maximumCommandBytes else {
+            throw X64DyldSharedCacheError.malformed("Cached dynamic linker \(image.installName) has unreasonable Mach-O load-command dimensions.")
+        }
+        let (totalBytes, overflow) = UInt64(machHeaderSize).addingReportingOverflow(UInt64(commandBytes))
+        guard !overflow, totalBytes <= UInt64(Int.max) else {
+            throw X64DyldSharedCacheError.malformed("Cached dynamic linker \(image.installName) load-command range overflows.")
+        }
+        let commands = try cache.readVMBytes(atVMAddress: image.machHeaderAddress, count: Int(totalBytes))
+        let commandEnd = machHeaderSize + Int(commandBytes)
+        var cursor = machHeaderSize
+        var segments: [Segment] = []
+        var threadEntryPoint: UInt64?
+        var mainEntryOffset: UInt64?
+
+        for commandIndex in 0..<Int(commandCount) {
+            guard cursor <= commandEnd - 8 else {
+                throw X64DyldSharedCacheError.malformed("Cached dynamic linker load command \(commandIndex) is truncated.")
+            }
+            let command = readLE32(commands, cursor)
+            let commandSize = readLE32(commands, cursor + 4)
+            guard commandSize >= 8, UInt64(commandSize) <= UInt64(commandEnd - cursor) else {
+                throw X64DyldSharedCacheError.malformed("Cached dynamic linker load command \(commandIndex) has an invalid size.")
+            }
+
+            switch command {
+            case lcSegment64:
+                guard commandSize >= segmentCommandSize else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker contains a truncated LC_SEGMENT_64 command.")
+                }
+                let sectionCount = readLE32(commands, cursor + 64)
+                let (sectionBytes, sectionOverflow) = UInt64(sectionCount).multipliedReportingOverflow(by: 80)
+                let (minimumSize, commandOverflow) = UInt64(segmentCommandSize).addingReportingOverflow(sectionBytes)
+                guard !sectionOverflow, !commandOverflow, minimumSize <= UInt64(commandSize) else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker segment sections exceed their load command.")
+                }
+                let nameBytes = commands[(cursor + 8)..<(cursor + 24)]
+                let name = String(decoding: nameBytes.prefix { $0 != 0 }, as: UTF8.self)
+                let vmAddress = readLE64(commands, cursor + 24)
+                let vmSize = readLE64(commands, cursor + 32)
+                let fileOffset = readLE64(commands, cursor + 40)
+                let fileSize = readLE64(commands, cursor + 48)
+                let maximumProtection = readLE32(commands, cursor + 56)
+                let initialProtection = readLE32(commands, cursor + 60)
+                let (_, vmOverflow) = vmAddress.addingReportingOverflow(vmSize)
+                let (_, fileOverflow) = fileOffset.addingReportingOverflow(fileSize)
+                guard !vmOverflow, !fileOverflow, fileSize <= vmSize,
+                      (maximumProtection & ~UInt32(0x7)) == 0,
+                      (initialProtection & ~UInt32(0x7)) == 0,
+                      (initialProtection & ~maximumProtection) == 0 else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker segment \(name) has an invalid VM range, file range, or protection mask.")
+                }
+                if vmSize > 0, name != "__PAGEZERO" {
+                    segments.append(Segment(
+                        name: name,
+                        virtualAddress: vmAddress,
+                        virtualSize: vmSize,
+                        fileOffset: fileOffset,
+                        fileSize: fileSize,
+                        initialProtection: initialProtection
+                    ))
+                }
+
+            case lcUnixThread:
+                guard commandSize >= 16 else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker contains a truncated LC_UNIXTHREAD command.")
+                }
+                let flavor = readLE32(commands, cursor + 8)
+                let wordCount = readLE32(commands, cursor + 12)
+                let (stateBytes, stateOverflow) = UInt64(wordCount).multipliedReportingOverflow(by: 4)
+                guard !stateOverflow, stateBytes <= UInt64(commandSize - 16) else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker LC_UNIXTHREAD state exceeds its command.")
+                }
+                if flavor == x86ThreadState64Flavor {
+                    guard wordCount >= x86ThreadState64WordCount else {
+                        throw X64DyldSharedCacheError.malformed("Cached dynamic linker x86_THREAD_STATE64 is too short to contain RIP.")
+                    }
+                    let ripOffset = cursor + 16 + x86ThreadState64RIPIndex * 8
+                    guard ripOffset <= cursor + Int(commandSize) - 8 else {
+                        throw X64DyldSharedCacheError.malformed("Cached dynamic linker x86_THREAD_STATE64 RIP is outside LC_UNIXTHREAD.")
+                    }
+                    let value = readLE64(commands, ripOffset)
+                    if let previous = threadEntryPoint, previous != value {
+                        throw X64DyldSharedCacheError.malformed("Cached dynamic linker advertises conflicting x86_64 LC_UNIXTHREAD entrypoints.")
+                    }
+                    threadEntryPoint = value
+                }
+
+            case lcMain:
+                guard commandSize >= 24 else {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker contains a truncated LC_MAIN command.")
+                }
+                let value = readLE64(commands, cursor + 8)
+                if let previous = mainEntryOffset, previous != value {
+                    throw X64DyldSharedCacheError.malformed("Cached dynamic linker advertises conflicting LC_MAIN entry offsets.")
+                }
+                mainEntryOffset = value
+
+            default:
+                break
+            }
+
+            cursor += Int(commandSize)
+        }
+
+        guard cursor == commandEnd else {
+            throw X64DyldSharedCacheError.malformed("Cached dynamic linker load commands do not consume sizeofcmds exactly.")
+        }
+        let executableSegments = segments.filter(\.isExecutable)
+        guard !executableSegments.isEmpty else {
+            throw X64DyldSharedCacheError.malformed("Cached dynamic linker has no executable Mach-O segment.")
+        }
+
+        let entryPoint: UInt64
+        if let threadEntryPoint {
+            entryPoint = threadEntryPoint
+        } else if let mainEntryOffset {
+            guard let segment = segments.first(where: {
+                mainEntryOffset >= $0.fileOffset && mainEntryOffset - $0.fileOffset < $0.fileSize
+            }) else {
+                throw X64DyldSharedCacheError.malformed("Cached dynamic linker's LC_MAIN offset is outside every file-backed segment.")
+            }
+            let delta = mainEntryOffset - segment.fileOffset
+            let (address, addressOverflow) = segment.virtualAddress.addingReportingOverflow(delta)
+            guard !addressOverflow else {
+                throw X64DyldSharedCacheError.malformed("Cached dynamic linker's LC_MAIN address overflows.")
+            }
+            entryPoint = address
+        } else {
+            throw X64DyldSharedCacheError.malformed("Cached x86_64 MH_DYLINKER has neither an x86_THREAD_STATE64 LC_UNIXTHREAD entry nor LC_MAIN.")
+        }
+
+        guard executableSegments.contains(where: {
+            entryPoint >= $0.virtualAddress && entryPoint < $0.virtualEnd
+        }) else {
+            throw X64DyldSharedCacheError.malformed(String(format: "Cached dynamic linker entrypoint 0x%016llX is not inside an executable segment.", entryPoint))
+        }
+
+        return X64DyldSharedCacheDylinkerEntry(
+            installName: image.installName,
+            machHeaderAddress: image.machHeaderAddress,
+            entryPoint: entryPoint,
+            executableSegments: executableSegments.map { $0.virtualAddress..<$0.virtualEnd }
+        )
+    }
+
+    private static func readLE32(_ data: Data, _ offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
+    }
+
+    private static func readLE64(_ data: Data, _ offset: Int) -> UInt64 {
+        UInt64(readLE32(data, offset))
+            | (UInt64(readLE32(data, offset + 4)) << 32)
+    }
+}
+
 // MARK: - Cached-image Mach-O segment inspection and mapping preflight
 
 struct X64DyldSharedCacheImageSegmentPlan: Sendable, Equatable {
@@ -891,6 +1124,7 @@ enum X64DyldSharedCacheImageMapper {
     private static let machMagic64: UInt32 = 0xFEED_FACF
     private static let cpuTypeX86_64: UInt32 = 0x0100_0007
     private static let fileTypeDylib: UInt32 = 0x6
+    private static let fileTypeDylinker: UInt32 = 0x7
     private static let lcSegment64: UInt32 = 0x19
     private static let machHeaderSize = 32
     private static let segmentCommandSize = 72
@@ -924,8 +1158,8 @@ enum X64DyldSharedCacheImageMapper {
                 continue
             }
             guard seenInstallNames.insert(image.installName).inserted else { continue }
-            guard image.fileType == fileTypeDylib else {
-                throw X64DyldSharedCacheError.malformed("Cached dependency \(image.installName) is not an MH_DYLIB image.")
+            guard image.fileType == fileTypeDylib || image.fileType == fileTypeDylinker else {
+                throw X64DyldSharedCacheError.malformed("Cached image \(image.installName) is neither an MH_DYLIB nor an MH_DYLINKER image.")
             }
 
             let header = try cache.readVMBytes(atVMAddress: image.machHeaderAddress, count: machHeaderSize)

@@ -35,6 +35,7 @@ enum X64DarwinRuntimeSelfTests {
                 arguments: ["--headless", "two words"],
                 environment: ["ZETA": "last", "ALPHA": "first"],
                 into: &memory,
+                dyldPath: "/usr/lib/dyld",
                 usableStackSize: 64 * 1024
             )
             try expect(startup.stackPointer % 16 == 0, "kernel KernelArgs stack alignment")
@@ -50,6 +51,13 @@ enum X64DarwinRuntimeSelfTests {
             let env1 = try memory.readUnsigned(at: startup.envpPointer + 8, byteCount: 8)
             try expect(try readCString(env0, memory: memory) == "ALPHA=first", "sorted envp[0]")
             try expect(try readCString(env1, memory: memory) == "ZETA=last", "sorted envp[1]")
+            let apple0 = try memory.readUnsigned(at: startup.applePointer, byteCount: 8)
+            let apple1 = try memory.readUnsigned(at: startup.applePointer + 8, byteCount: 8)
+            let apple2 = try memory.readUnsigned(at: startup.applePointer + 16, byteCount: 8)
+            try expect(try readCString(apple0, memory: memory) == "executable_path=/Applications/Kyty.app/Contents/MacOS/kyty_emulator", "apple executable_path")
+            try expect(try readCString(apple1, memory: memory) == "dyld_path=/usr/lib/dyld", "apple dyld_path")
+            try expect(try readCString(apple2, memory: memory) == "platform=MACOS", "apple platform follows dyld_path")
+            try expect(startup.dyldPath == "/usr/lib/dyld", "startup retains dyld path")
             try expect(memory.permissions(at: startup.stackReservation.baseAddress) == nil, "low stack guard")
             try expect(memory.permissions(at: startup.stackReservation.endAddress - 1) == nil, "high stack guard")
             var initialState = X64CPUState()
@@ -244,6 +252,51 @@ enum X64DarwinRuntimeSelfTests {
             try expect(host.output == [0x4F, 0x4B], "guest write syscall reaches host stdout")
             try expect(result.report.exit == .halted && result.exitStatus == 0, "guest main returns after host write")
             passed.append("Launched x86_64 guest code executes Darwin SYS_write through the host bridge and returns normally")
+        }
+
+        do {
+            let image = try X64MachOParser.parse(data: X64MachOLoaderSelfTests.makeFreestandingMainExecutable(
+                code: [0xC3] // LC_MAIN is the handoff boundary; do not execute it in this test.
+            ))
+            var memory = try X64GuestVirtualMemory()
+            let loaded = try X64MachOLoader.load(image, into: &memory)
+            let dyldAddress: UInt64 = 0x6_F000_0000
+            try memory.reserve(at: dyldAddress, byteCount: 0x1000, kind: .shared)
+            try memory.commit(at: dyldAddress, byteCount: 0x1000, permissions: .readExecute)
+            var dyldCode: [UInt8] = [0x48, 0xB8] // movabs rax, <LC_MAIN>
+            for shift in stride(from: 0, to: 64, by: 8) {
+                dyldCode.append(UInt8(truncatingIfNeeded: loaded.entryAddress >> shift))
+            }
+            dyldCode.append(contentsOf: [0xFF, 0xE0]) // jmp rax
+            try memory.writeBytes(dyldCode, at: dyldAddress)
+            let dyld = X64DyldSharedCacheDylinkerEntry(
+                installName: "/usr/lib/dyld",
+                machHeaderAddress: dyldAddress,
+                entryPoint: dyldAddress,
+                executableSegments: [dyldAddress..<(dyldAddress + 0x1000)]
+            )
+            let startup = try X64GuestProcessStackBuilder.build(
+                entryPoint: loaded.entryAddress,
+                mainMachHeaderAddress: loaded.preferredLoadAddress + loaded.slide,
+                executablePath: image.sourceName,
+                arguments: [],
+                environment: [:],
+                into: &memory,
+                dyldPath: dyld.installName,
+                usableStackSize: 64 * 1024
+            )
+            let result = try X64GuestDyldLauncher.launch(
+                dyld: dyld,
+                loadedImage: loaded,
+                startup: startup,
+                memory: &memory,
+                maximumInstructions: 100,
+                maximumBlocks: 100
+            )
+            try expect(result.reachedMainEntry, "dyld execution stops at the main LC_MAIN handoff")
+            try expect(result.finalState.rip == loaded.entryAddress, "guest RIP is the real main executable entrypoint")
+            try expect(result.finalState.registerValue(.rsp) == startup.stackPointer, "kernel startup RSP survives the minimal dyld handoff")
+            passed.append("Cache-backed dyld entry executes under native AArch64 translation and hands off at the main executable LC_MAIN boundary")
         }
 
         do {

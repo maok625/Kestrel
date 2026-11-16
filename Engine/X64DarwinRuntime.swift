@@ -15,6 +15,7 @@ struct X64GuestProcessStartupState: Sendable, Equatable {
     let argvPointer: UInt64
     let envpPointer: UInt64
     let applePointer: UInt64
+    let dyldPath: String?
     let stackReservation: X64GuestVirtualRegionInfo
     let usableStackBase: UInt64
     let usableStackSize: UInt64
@@ -54,6 +55,7 @@ enum X64GuestProcessStackBuilder {
         arguments: [String],
         environment: [String: String],
         into memory: inout X64GuestVirtualMemory,
+        dyldPath: String? = nil,
         usableStackSize: UInt64 = defaultUsableStackSize
     ) throws -> X64GuestProcessStartupState {
         guard arguments.count <= 4_096 else { throw X64GuestProcessStartupError.tooManyArguments }
@@ -82,7 +84,9 @@ enum X64GuestProcessStackBuilder {
             let envp = environment.keys.sorted().map { "\($0)=\(environment[$0] ?? "")" }
             // This is intentionally a minimal apple vector, not the complete
             // set of kernel parameters consumed by every dyld version.
-            let apple = ["executable_path=\(executablePath)", "platform=MACOS"]
+            var apple = ["executable_path=\(executablePath)"]
+            if let dyldPath { apple.append("dyld_path=\(dyldPath)") }
+            apple.append("platform=MACOS")
             var cursor = usableBase + usableStackSize
 
             func pushString(_ value: String, cursor: inout UInt64, memory: inout X64GuestVirtualMemory) throws -> UInt64 {
@@ -156,6 +160,7 @@ enum X64GuestProcessStackBuilder {
                 argvPointer: stackPointer + UInt64(argvPointerOffset),
                 envpPointer: stackPointer + UInt64(envpPointerOffset),
                 applePointer: stackPointer + UInt64(applePointerOffset),
+                dyldPath: dyldPath,
                 stackReservation: reservation,
                 usableStackBase: usableBase,
                 usableStackSize: usableStackSize
@@ -280,6 +285,110 @@ enum X64GuestDirectMainLauncher {
         case .memoryFault:
             return X64GuestDirectMainLaunchResult(report: report, exitStatus: nil, returnedFromMain: false)
         }
+    }
+}
+
+struct X64GuestDyldLaunchResult: Sendable {
+    let report: X64ARM64DispatchReport
+    let finalState: X64CPUState
+    let mainEntryPoint: UInt64
+
+    /// True only when dyld executed from its real cache entrypoint and the
+    /// dispatcher stopped exactly at the executable's LC_MAIN handoff.
+    var reachedMainEntry: Bool {
+        report.exit == .halted && report.finalRIP == mainEntryPoint
+    }
+}
+
+/// Starts the cache-backed x86_64 dynamic linker with the kernel-shaped
+/// KernelArgs stack and stops at the main executable's LC_MAIN entrypoint.
+/// dyld, not Kestrel, is responsible for interpreting the main image's bind
+/// and chained-fixup metadata during this path.
+enum X64GuestDyldLauncher {
+    static let defaultMaximumInstructions = 20_000_000
+    static let defaultMaximumBlocks = 2_000_000
+    static let continuationMaximumInstructions = 5_000_000
+    static let continuationMaximumBlocks = 500_000
+
+    static func launch(
+        dyld: X64DyldSharedCacheDylinkerEntry,
+        loadedImage: X64MachOLoadedImage,
+        startup: X64GuestProcessStartupState,
+        memory: inout X64GuestVirtualMemory,
+        hostThunks: X64DarwinHostThunkTable? = nil,
+        syscallHost: any X64DarwinSyscallHost = X64ConsoleDarwinSyscallHost(),
+        maximumInstructions: Int = defaultMaximumInstructions,
+        maximumBlocks: Int = defaultMaximumBlocks
+    ) throws -> X64GuestDyldLaunchResult {
+        guard startup.dyldPath == dyld.installName else {
+            throw X64MachOFormatError(message: "KernelArgs does not contain the dyld_path for the selected guest dynamic linker.")
+        }
+        guard startup.entryPoint == loadedImage.entryAddress else {
+            throw X64MachOFormatError(message: "KernelArgs LC_MAIN does not match the loaded main executable entrypoint.")
+        }
+        let (expectedHeader, headerOverflow) = loadedImage.preferredLoadAddress.addingReportingOverflow(loadedImage.slide)
+        guard !headerOverflow, startup.mainMachHeaderAddress == expectedHeader,
+              memory.region(containing: startup.mainMachHeaderAddress) != nil else {
+            throw X64MachOFormatError(message: "KernelArgs main mach_header is not the mapped main executable header.")
+        }
+        guard memory.permissions(at: dyld.entryPoint)?.contains(.execute) == true else {
+            throw X64MachOFormatError(message: "The selected __dyld_start entrypoint is not mapped with guest execute permission.")
+        }
+        guard memory.permissions(at: loadedImage.entryAddress)?.contains(.execute) == true else {
+            throw X64MachOFormatError(message: "The main executable LC_MAIN handoff is not mapped with guest execute permission.")
+        }
+
+        var state = X64CPUState()
+        try startup.installDyldEntry(dyldEntryPoint: dyld.entryPoint, into: &state)
+        var dispatcher = X64ARM64BlockDispatcher()
+        let report = try dispatcher.run(
+            state: &state,
+            memory: &memory,
+            until: loadedImage.entryAddress,
+            maximumInstructions: maximumInstructions,
+            maximumBlocks: maximumBlocks,
+            syscallHost: syscallHost,
+            hostThunks: hostThunks,
+            allowSystemCalls: true
+        )
+        return X64GuestDyldLaunchResult(
+            report: report,
+            finalState: state,
+            mainEntryPoint: loadedImage.entryAddress
+        )
+    }
+
+    /// Resumes the state produced by a successful dyld handoff and begins
+    /// executing the actual x86_64 program entrypoint. This is deliberately a
+    /// separate bounded phase so dyld-start failures remain distinguishable
+    /// from application instruction/syscall/ABI failures.
+    static func continueFromMain(
+        state: inout X64CPUState,
+        loadedImage: X64MachOLoadedImage,
+        startup: X64GuestProcessStartupState,
+        memory: inout X64GuestVirtualMemory,
+        hostThunks: X64DarwinHostThunkTable? = nil,
+        syscallHost: any X64DarwinSyscallHost = X64ConsoleDarwinSyscallHost(),
+        maximumInstructions: Int = continuationMaximumInstructions,
+        maximumBlocks: Int = continuationMaximumBlocks
+    ) throws -> X64ARM64DispatchReport {
+        guard state.rip == loadedImage.entryAddress else {
+            throw X64MachOFormatError(message: "Guest continuation is not positioned at the main executable LC_MAIN entrypoint.")
+        }
+        guard memory.permissions(at: state.rip)?.contains(.execute) == true else {
+            throw X64MachOFormatError(message: "The guest program entrypoint is not executable.")
+        }
+        var dispatcher = X64ARM64BlockDispatcher()
+        return try dispatcher.run(
+            state: &state,
+            memory: &memory,
+            until: startup.stackReservation.baseAddress,
+            maximumInstructions: maximumInstructions,
+            maximumBlocks: maximumBlocks,
+            syscallHost: syscallHost,
+            hostThunks: hostThunks,
+            allowSystemCalls: true
+        )
     }
 }
 

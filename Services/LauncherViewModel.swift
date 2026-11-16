@@ -178,6 +178,8 @@ final class LauncherViewModel: ObservableObject {
     @Published var canLoadX86MachOImage = false
     @Published var canPrepareGuestProcessStartup = false
     @Published private(set) var canLaunchX64Guest = false
+    @Published private(set) var canLaunchX64GuestViaDyld = false
+    @Published private(set) var canContinueX64GuestAfterDyld = false
     @Published var canMaterializeCachedDependencies = false
     @Published var canResolveCachedImports = false
 
@@ -197,6 +199,10 @@ final class LauncherViewModel: ObservableObject {
     private var preparedStartupState: X64GuestProcessStartupState?
     private var inspectedDyldSharedCache: X64DyldSharedCacheSummary?
     private var plannedDyldSharedCacheMappings: X64DyldSharedCacheMappingPlan?
+    private var cachedDyldEntry: X64DyldSharedCacheDylinkerEntry?
+    private var cachedDependencyClosureIsComplete = false
+    private var cachedDependenciesMaterialized = false
+    private var postDyldCPUState: X64CPUState?
 
     func chooseTarget() {
         guard !isBusy else { return }
@@ -243,6 +249,12 @@ final class LauncherViewModel: ObservableObject {
         preparedStartupState = nil
         inspectedDyldSharedCache = nil
         plannedDyldSharedCacheMappings = nil
+        cachedDyldEntry = nil
+        cachedDependencyClosureIsComplete = false
+        cachedDependenciesMaterialized = false
+        postDyldCPUState = nil
+        canLaunchX64GuestViaDyld = false
+        canContinueX64GuestAfterDyld = false
         canMaterializeCachedDependencies = false
         canResolveCachedImports = false
         canPrepareGuestProcessStartup = false
@@ -342,15 +354,36 @@ final class LauncherViewModel: ObservableObject {
                     executablePath: target.executableURL.path,
                     arguments: parseArguments(argumentsText),
                     environment: parseEnvironment(environmentText),
-                    into: &memory
+                    into: &memory,
+                    dyldPath: cachedDyldEntry?.installName
                 )
                 loadedGuestMemory = memory
                 preparedStartupState = startup
                 canPrepareGuestProcessStartup = true
+                postDyldCPUState = nil
+                canContinueX64GuestAfterDyld = false
+                let dyldEntryIsExecutable = cachedDyldEntry.map {
+                    memory.permissions(at: $0.entryPoint)?.contains(.execute) == true
+                } ?? false
+                let mainEntryIsExecutable = memory.permissions(at: loadedMachOImage.entryAddress)?.contains(.execute) == true
+                canLaunchX64GuestViaDyld = cachedDependenciesMaterialized
+                    && cachedDependencyClosureIsComplete
+                    && dyldEntryIsExecutable
+                    && mainEntryIsExecutable
                 append("PASS: Darwin kernel-style KernelArgs stack prepared (not executed).")
                 append(String(format: "Main mach_header: 0x%016llX; LC_MAIN after dyld: 0x%016llX; initial RSP: 0x%016llX; RSP mod 16: %llu", startup.mainMachHeaderAddress, startup.entryPoint, startup.stackPointer, startup.stackPointer % 16))
                 append("argc: \(startup.argumentCount); argv: 0x\(String(startup.argvPointer, radix: 16)); envp: 0x\(String(startup.envpPointer, radix: 16)); apple: 0x\(String(startup.applePointer, radix: 16))")
-                append("Stack reservation: \(startup.usableStackSize) usable bytes plus two guard pages. The stack matches the kernel-to-dyld KernelArgs shape, but Kestrel does not yet map/initialize dyld or its shared-cache entrypoint, so it cannot install a valid initial RIP or transfer execution.")
+                append("Stack reservation: \(startup.usableStackSize) usable bytes plus two guard pages.")
+                if let dyld = cachedDyldEntry {
+                    append(String(format: "dyld_path=%@; __dyld_start=0x%016llX; dyld mapped executable=%@", dyld.installName, dyld.entryPoint, dyldEntryIsExecutable ? "yes" : "no"))
+                } else {
+                    append("BLOCKED: no x86_64 MH_DYLINKER entry was found in the selected Rosetta cache; KernelArgs has no dyld_path.")
+                }
+                if canLaunchX64GuestViaDyld {
+                    append("DYLD LAUNCH READY: recursive cache dependencies are materialized, the dyld entry is executable, and LC_MAIN is mapped. Kestrel will now let dyld handle the main executable's bind and chained-fixup metadata.")
+                } else {
+                    append("DYLD LAUNCH NOT READY: materialize a complete cache dependency closure and map the x86_64 dyld image before attempting __dyld_start.")
+                }
             } catch {
                 // The loaded image is still valid, so keep the other actions
                 // enabled and let the user retry.
@@ -489,6 +522,14 @@ final class LauncherViewModel: ObservableObject {
             return
         }
         isBusy = true
+        plannedDyldSharedCacheMappings = nil
+        cachedDyldEntry = nil
+        cachedDependencyClosureIsComplete = false
+        cachedDependenciesMaterialized = false
+        canMaterializeCachedDependencies = false
+        canLaunchX64GuestViaDyld = false
+        canContinueX64GuestAfterDyld = false
+        postDyldCPUState = nil
         let dependencies = loadedMachOImage.dependencies
         Task {
             do {
@@ -498,7 +539,12 @@ final class LauncherViewModel: ObservableObject {
                         cache: cache,
                         roots: dependencies
                     )
-                    let mappingDependencies = dependencyClosure.installNames.enumerated().map { index, installName in
+                    let dyldEntry = try X64DyldSharedCacheDylinkerReader.find(in: cache)
+                    var selectedInstallNames = dependencyClosure.installNames
+                    if let dyldEntry, !selectedInstallNames.contains(dyldEntry.installName) {
+                        selectedInstallNames.append(dyldEntry.installName)
+                    }
+                    let mappingDependencies = selectedInstallNames.enumerated().map { index, installName in
                         X64MachODylibDependency(
                             ordinal: index + 1,
                             installName: installName,
@@ -512,17 +558,26 @@ final class LauncherViewModel: ObservableObject {
                         cache: cache,
                         dependencies: mappingDependencies
                     )
-                    return (cache, plan, dependencyClosure)
+                    return (cache, plan, dependencyClosure, dyldEntry)
                 }.value
                 let cache = planned.0
                 let plan = planned.1
                 let dependencyClosure = planned.2
+                let dyldEntry = planned.3
                 inspectedDyldSharedCache = cache
+                cachedDyldEntry = dyldEntry
+                cachedDependencyClosureIsComplete = dependencyClosure.isComplete
                 plannedDyldSharedCacheMappings = plan
                 let withinMaterializationLimit = plan.totalPageRoundedReservationBytes <= LauncherViewModel.materializationLimitBytes
                 canMaterializeCachedDependencies = withinMaterializationLimit && dependencyClosure.isComplete
+                canLaunchX64GuestViaDyld = false
                 append("PASS: recursive shared-cache dependency closure and mapping preflight completed.")
-                append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependencies: \(dependencyClosure.rootImageCount); transitive dependencies: \(dependencyClosure.transitiveImageCount)")
+                append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependencies: \(dependencyClosure.rootImageCount); transitive dependencies: \(dependencyClosure.transitiveImageCount); dyld image: \(dyldEntry == nil ? "missing" : "included")")
+                if let dyldEntry {
+                    append(String(format: "DYLD IMAGE: %@; mach_header=0x%016llX; __dyld_start=0x%016llX", dyldEntry.installName, dyldEntry.machHeaderAddress, dyldEntry.entryPoint))
+                } else {
+                    append("BLOCKED: no x86_64 MH_DYLINKER was found in this Rosetta shared cache; dependencies can still be inspected, but normal guest startup cannot begin.")
+                }
                 append("Dependency metadata parsed: \(dependencyClosure.parsedExportCount) exports from \(dependencyClosure.exportTrieBytes) bytes of export tries.")
                 if dependencyClosure.truncated {
                     append("BLOCKED: recursive dependency closure reached its safety limit (1,024 mapped images or 8,192 queued names); the mapped set is incomplete.")
@@ -560,6 +615,7 @@ final class LauncherViewModel: ObservableObject {
                 }
                 if dependencyClosure.isComplete {
                     append("PREFLIGHT COMPLETE: all discovered required cache-backed dependencies have validated segment mappings, including ordinary transitive LC_LOAD_DYLIB edges. The next action copies their pages into guest-owned backing, applies slide-info v2 fixups, then installs cache mapping protections.")
+                    if dyldEntry != nil { append("The __dyld_start image is included in the same guest mapping transaction.") }
                 } else {
                     append("PREFLIGHT INCOMPLETE: do not materialize this partial closure as a launchable process. Resolve the missing or truncated dependency set first.")
                 }
@@ -575,7 +631,7 @@ final class LauncherViewModel: ObservableObject {
         guard let cache = inspectedDyldSharedCache,
               let plan = plannedDyldSharedCacheMappings,
               let originalMemory = loadedGuestMemory else {
-            append("Analyze cached dependency segments successfully before materializing them.")
+            append("Analyze the recursive dependency closure and dyld mapping plan successfully before materializing them.")
             return
         }
 
@@ -604,7 +660,9 @@ final class LauncherViewModel: ObservableObject {
                 append("PASS: cached dependency pages copied into guest-owned memory and slide-info v2 fixups applied.")
                 append("Cache UUID: \(result.1.cacheUUID); images: \(result.1.imageCount); guest pages: \(result.1.pageCount); bytes copied: \(result.1.byteCount)")
                 append("Guest regions reserved: \(result.1.reservedRegionCount); pointer words rebased: \(result.1.rebasedPointerCount); cache slide: 0x\(String(result.1.cacheSlideAmount, radix: 16))")
-                append("Cache bytes were never modified. Pages now carry the cache mapping's initial guest protections (including RX text and read-only linkedit). This still does not recursively load further dependencies, resolve kyty_emulator's 1053 unresolved imports, initialize dyld, or execute LC_MAIN.")
+                cachedDependenciesMaterialized = true
+                canLaunchX64GuestViaDyld = false
+                append("Cache bytes were never modified. Pages now carry the cache mapping's initial guest protections (including RX text and read-only linkedit). The mapped set includes the complete discovered recursive dependency closure and the x86_64 dyld image when present. Prepare KernelArgs with dyld_path next; then Kestrel can attempt __dyld_start.")
             } catch {
                 append("DYLD CACHE MATERIALIZATION FAILED (guest-memory transaction rolled back): \(error.localizedDescription)")
             }
@@ -654,6 +712,9 @@ final class LauncherViewModel: ObservableObject {
                 loadedMachOImage = result.1
                 preparedStartupState = nil
                 canPrepareGuestProcessStartup = true
+                canLaunchX64GuestViaDyld = false
+                canContinueX64GuestAfterDyld = false
+                postDyldCPUState = nil
                 canResolveCachedImports = false
                 append("PASS: cached dylib export metadata parsed; supported dependency-qualified bind fixups applied.")
                 append("Cached images examined: \(result.2.examinedImageCount); dependency closure images: \(result.2.dependencyClosureImageCount); export symbols parsed: \(result.2.parsedExportCount); export trie bytes: \(result.2.exportTrieBytes)")
@@ -724,7 +785,7 @@ final class LauncherViewModel: ObservableObject {
                         append(String(format: "    export resolver guest address: 0x%016llX; mapped executable: %@", resolver, executable))
                     }
                 }
-                append("The main image was reloaded transactionally against guest addresses from materialized cache pages. This does not initialize dyld, resolve every symbol form, create TLS/errno, or execute LC_MAIN.")
+                append("The main image was reloaded transactionally against guest addresses from materialized cache pages. This diagnostic prebinding pass is optional for the dyld launch path: dyld is expected to process the main executable bind and chained-fixup commands itself. TLS/errno and the broader Darwin process ABI remain incomplete.")
             } catch {
                 append("CACHED IMPORT RESOLUTION FAILED (original guest memory and image retained): \(error.localizedDescription)")
             }
@@ -799,6 +860,122 @@ final class LauncherViewModel: ObservableObject {
                 append("This is a freestanding direct-main prototype. It does not run dyld initializers, load dependent libraries, or provide libc/framework compatibility.")
             } catch {
                 append("GUEST LAUNCH BLOCKED/FAILED: \(error.localizedDescription)")
+            }
+            isBusy = false
+        }
+    }
+
+
+    func launchSelectedX64GuestViaDyld() {
+        guard !isBusy else { return }
+        guard let dyld = cachedDyldEntry,
+              let loadedImage = loadedMachOImage,
+              let startup = preparedStartupState,
+              let originalMemory = loadedGuestMemory else {
+            append("Prepare the recursive cache mapping and KernelArgs stack before starting x86_64 dyld.")
+            return
+        }
+        guard canLaunchX64GuestViaDyld else {
+            append("BLOCKED: the recursive dependency closure, materialized dyld image, or executable entry permissions are not ready.")
+            return
+        }
+
+        let hostThunks = guestHostThunkTable
+        isBusy = true
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    var memory = originalMemory
+                    let execution = try X64GuestDyldLauncher.launch(
+                        dyld: dyld,
+                        loadedImage: loadedImage,
+                        startup: startup,
+                        memory: &memory,
+                        hostThunks: hostThunks
+                    )
+                    return (memory, execution)
+                }.value
+
+                loadedGuestMemory = result.0
+                canLaunchX64GuestViaDyld = false
+                if result.1.reachedMainEntry {
+                    postDyldCPUState = result.1.finalState
+                    canContinueX64GuestAfterDyld = true
+                    append("DYLD HANDOFF COMPLETE: __dyld_start executed and reached the main executable's LC_MAIN entrypoint.")
+                    append(String(format: "dyld entry=0x%016llX; LC_MAIN=0x%016llX; RSP=0x%016llX; instructions=%d; blocks=%d",
+                                  dyld.entryPoint,
+                                  result.1.mainEntryPoint,
+                                  result.1.finalState.registerValue(.rsp),
+                                  result.1.report.instructionsExecuted,
+                                  result.1.report.blocksExecuted))
+                    append("The next action continues execution inside the actual x86_64 program. This is the first non-direct-main launch path.")
+                } else {
+                    postDyldCPUState = nil
+                    canContinueX64GuestAfterDyld = false
+                    switch result.1.report.exit {
+                    case .processExit(let status):
+                        append("DYLD EXITED BEFORE LC_MAIN: status \(status).")
+                    case .memoryFault(let address):
+                        append(String(format: "DYLD MEMORY/EXECUTE FAULT before LC_MAIN at guest RIP 0x%016llX.", address))
+                    case .halted:
+                        append("DYLD stopped without a matching main-entry handoff.")
+                    }
+                    append(String(format: "dyld instructions=%d; blocks=%d; final RIP=0x%016llX",
+                                  result.1.report.instructionsExecuted,
+                                  result.1.report.blocksExecuted,
+                                  result.1.report.finalRIP))
+                }
+                append("Translation cache: hits=\(result.1.report.cache.hits), misses=\(result.1.report.cache.misses), compiled=\(result.1.report.cache.compilations).")
+            } catch {
+                canContinueX64GuestAfterDyld = false
+                postDyldCPUState = nil
+                append("DYLD STARTUP STOPPED: \(error.localizedDescription)")
+            }
+            isBusy = false
+        }
+    }
+
+    func continueSelectedX64GuestAfterDyld() {
+        guard !isBusy else { return }
+        guard canContinueX64GuestAfterDyld,
+              var state = postDyldCPUState,
+              let loadedImage = loadedMachOImage,
+              let startup = preparedStartupState,
+              let originalMemory = loadedGuestMemory else {
+            append("Run x86_64 dyld successfully to the LC_MAIN handoff before continuing into the program.")
+            return
+        }
+        let hostThunks = guestHostThunkTable
+        isBusy = true
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    var memory = originalMemory
+                    let report = try X64GuestDyldLauncher.continueFromMain(
+                        state: &state,
+                        loadedImage: loadedImage,
+                        startup: startup,
+                        memory: &memory,
+                        hostThunks: hostThunks
+                    )
+                    return (memory, state, report)
+                }.value
+                loadedGuestMemory = result.0
+                postDyldCPUState = result.1
+                canContinueX64GuestAfterDyld = false
+                switch result.2.exit {
+                case .processExit(let status):
+                    append("GUEST PROCESS EXIT: status \(status).")
+                case .memoryFault(let address):
+                    append(String(format: "GUEST MEMORY/EXECUTE FAULT at instruction RIP 0x%016llX.", address))
+                case .halted:
+                    append("GUEST EXECUTION HALTED at the guarded return boundary.")
+                }
+                append("Program instructions=\(result.2.instructionsExecuted); blocks=\(result.2.blocksExecuted); final RIP=0x\(String(result.2.finalRIP, radix: 16)).")
+                append("Translation cache: hits=\(result.2.cache.hits), misses=\(result.2.cache.misses), compiled=\(result.2.cache.compilations).")
+            } catch {
+                canContinueX64GuestAfterDyld = false
+                append("GUEST EXECUTION STOPPED: \(error.localizedDescription)")
             }
             isBusy = false
         }
