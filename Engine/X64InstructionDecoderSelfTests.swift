@@ -147,6 +147,50 @@ enum X64InstructionDecoderSelfTests {
         try expect(syscall.length == 2 && syscallIR.operation == .systemCall, "SYSCALL boundary decoding")
         passed.append("SYSCALL decodes to an explicit dispatcher boundary rather than an unsupported opcode")
 
+        // 14. TEST, Group 1 AND, and the supported Group 3 operations.
+        let testRegister = try decoder.decode([0x48, 0x85, 0xD8])
+        let testRegisterIR = try testRegister.lowerToIR()
+        try expect(
+            testRegisterIR.operation == .test &&
+            testRegisterIR.destination == .register(try X64RegisterOperand(register: .rax, width: .qword)) &&
+            testRegisterIR.source == .register(try X64RegisterOperand(register: .rbx, width: .qword)),
+            "TEST r/m64, r64 operands"
+        )
+        let group1And = try decoder.decode([0x48, 0x83, 0xE0, 0x0F]).lowerToIR()
+        try expect(
+            group1And.operation == .bitwiseAnd &&
+            group1And.source == .immediate(value: 0x0F, encodedByteCount: 1),
+            "Group 1 /4 AND immediate"
+        )
+        let group3Test = try decoder.decode([0xF6, 0xC1, 0x80])
+        try expect(group3Test.length == 3 && group3Test.lowerToIR().operation == .test, "F6 /0 TEST consumes imm8")
+        let group3Not = try decoder.decode([0xF6, 0xD1])
+        try expect(group3Not.length == 2 && group3Not.lowerToIR().operation == .bitwiseNot, "F6 /2 NOT has no immediate")
+        let group3Negate = try decoder.decode([0xF6, 0xD9])
+        try expect(group3Negate.length == 2 && group3Negate.lowerToIR().operation == .negate, "F6 /3 NEG has no immediate")
+        let group3QwordTest = try decoder.decode([0x48, 0xF7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]).lowerToIR()
+        try expect(
+            group3QwordTest.source == .immediate(value: UInt64.max, encodedByteCount: 4),
+            "F7 /0 sign-extends imm32 for a qword TEST"
+        )
+        passed.append("TEST, Group 1 AND, and Group 3 TEST/NOT/NEG decode with correct widths and immediate lengths")
+
+        // 15. 0F BA immediate bit-test group extensions /4 through /7.
+        let bitCases: [(UInt8, X64BitTestKind)] = [
+            (0xE0, .test), (0xE8, .set), (0xF0, .reset), (0xF8, .complement)
+        ]
+        for (modRMByte, expectedKind) in bitCases {
+            let decoded = try decoder.decode([0x0F, 0xBA, modRMByte, 0x41])
+            let ir = try decoded.lowerToIR()
+            guard case .bitTest(let kind) = ir.operation else {
+                throw TestError.failed("0F BA did not lower to a bit-test operation")
+            }
+            try expect(kind == expectedKind && ir.width == .dword, "0F BA group extension and operand width")
+            try expect(ir.source == .immediate(value: 0x41, encodedByteCount: 1), "0F BA preserves the imm8 bit index")
+        }
+        try expectThrows({ _ = try decoder.decode([0x0F, 0xBA, 0xC0, 0x01]).lowerToIR() }, "invalid 0F BA /0 extension")
+        passed.append("0F BA BT/BTS/BTR/BTC immediate bit-index decoding")
+
         return passed
     }
 

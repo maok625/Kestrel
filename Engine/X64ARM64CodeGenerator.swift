@@ -85,7 +85,7 @@ enum X64ARM64CodeGenerator {
         guard !instructions.isEmpty else { throw CodegenError.emptyBlock }
         let needsFlagHelper = instructions.contains { instruction in
             switch instruction.operation {
-            case .add, .subtract, .compare, .bitwiseXor: return true
+            case .add, .subtract, .compare, .bitwiseAnd, .bitwiseXor, .test, .negate: return true
             default: return false
             }
         }
@@ -182,7 +182,7 @@ enum X64ARM64CodeGenerator {
                 lhsRegister, to: destination, width: width, instruction: instruction, state: &state
             )
 
-        case .add, .subtract, .compare, .bitwiseXor:
+        case .add, .subtract, .compare, .bitwiseAnd, .bitwiseXor, .test:
             guard let destination = instruction.destination,
                   let source = instruction.source,
                   let width = instruction.width else {
@@ -203,6 +203,8 @@ enum X64ARM64CodeGenerator {
                 state.words.append(encodeAdd(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: is64Bit))
             case .subtract, .compare:
                 state.words.append(encodeSub(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: is64Bit))
+            case .bitwiseAnd, .test:
+                state.words.append(encodeANDRegister(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: is64Bit))
             case .bitwiseXor:
                 state.words.append(encodeEor(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: is64Bit))
             default: break
@@ -216,7 +218,7 @@ enum X64ARM64CodeGenerator {
             switch instruction.operation {
             case .add: flagKind = 0
             case .subtract, .compare: flagKind = 1
-            case .bitwiseXor: flagKind = 2
+            case .bitwiseAnd, .bitwiseXor, .test: flagKind = 2
             default: flagKind = 0
             }
             emitFlagHelper(
@@ -228,11 +230,107 @@ enum X64ARM64CodeGenerator {
                 kind: flagKind,
                 into: &state.words
             )
-            if instruction.operation != .compare {
+            if instruction.operation != .compare && instruction.operation != .test {
                 try emitWrite(
                     savedResultRegister, to: destination, width: width, instruction: instruction, state: &state
                 )
             }
+
+        case .bitwiseNot:
+            guard let destination = instruction.destination, let width = instruction.width else {
+                throw unsupported(instruction, "NOT requires a destination and width")
+            }
+            try emitRead(destination, width: width, into: lhsRegister, instruction: instruction, state: &state)
+            emitLoadConstant(UInt64.max, into: rhsRegister, output: &state.words)
+            state.words.append(encodeEor(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: true))
+            try emitWrite(lhsRegister, to: destination, width: width, instruction: instruction, state: &state)
+
+        case .negate:
+            guard let destination = instruction.destination, let width = instruction.width else {
+                throw unsupported(instruction, "NEG requires a destination and width")
+            }
+            try emitRead(destination, width: width, into: rhsRegister, instruction: instruction, state: &state)
+            emitLoadConstant(0, into: savedLHSRegister, output: &state.words)
+            state.words.append(encodeSub(
+                rd: lhsRegister,
+                rn: savedLHSRegister,
+                rm: rhsRegister,
+                is64Bit: width == .qword
+            ))
+            if width != .qword {
+                state.words.append(encodeUBFX(rd: lhsRegister, rn: lhsRegister, lsb: 0, width: width.bitCount))
+            }
+            state.words.append(encodeMOVRegister(rd: savedResultRegister, rn: lhsRegister, is64Bit: true))
+            emitFlagHelper(
+                helperAddress: helperAddress,
+                lhs: savedLHSRegister,
+                rhs: rhsRegister,
+                result: savedResultRegister,
+                width: UInt32(width.bitCount),
+                kind: 1,
+                into: &state.words
+            )
+            try emitWrite(savedResultRegister, to: destination, width: width, instruction: instruction, state: &state)
+
+        case .bitTest(let kind):
+            guard let destination = instruction.destination,
+                  let source = instruction.source,
+                  let width = instruction.width,
+                  case .immediate(let encodedIndex, _) = source else {
+                throw unsupported(instruction, "BT/BTS/BTR/BTC requires an r/m destination, imm8 index, and width")
+            }
+            let bitIndex = Int(encodedIndex & 0xFF)
+            let bitPosition = bitIndex % width.bitCount
+            var accessDestination = destination
+            if case .memory(let memoryOperand) = destination {
+                let byteOffset = Int64((bitIndex / width.bitCount) * (width.bitCount / 8))
+                let (displacement, overflow) = memoryOperand.displacement.addingReportingOverflow(byteOffset)
+                guard !overflow else {
+                    throw unsupported(instruction, "bit-string memory offset overflows the decoded displacement")
+                }
+                accessDestination = .memory(X64MemoryOperand(
+                    base: memoryOperand.base,
+                    index: memoryOperand.index,
+                    scale: memoryOperand.scale,
+                    displacement: displacement,
+                    ripRelative: memoryOperand.ripRelative,
+                    addressWidth: memoryOperand.addressWidth,
+                    segmentOverride: memoryOperand.segmentOverride
+                ))
+            }
+            try emitRead(accessDestination, width: width, into: lhsRegister, instruction: instruction, state: &state)
+            state.words.append(encodeUBFX(rd: savedLHSRegister, rn: lhsRegister, lsb: bitPosition, width: 1))
+
+            if kind != .test {
+                let bitMask = UInt64(1) << bitPosition
+                switch kind {
+                case .test: break
+                case .set:
+                    emitLoadConstant(bitMask, into: rhsRegister, output: &state.words)
+                    state.words.append(encodeORRRegister(rd: lhsRegister, rn: lhsRegister, rm: rhsRegister))
+                case .reset:
+                    emitLoadConstant(~bitMask, into: rhsRegister, output: &state.words)
+                    state.words.append(encodeANDRegister(
+                        rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: width == .qword
+                    ))
+                case .complement:
+                    emitLoadConstant(bitMask, into: rhsRegister, output: &state.words)
+                    state.words.append(encodeEor(
+                        rd: lhsRegister, rn: lhsRegister, rm: rhsRegister, is64Bit: width == .qword
+                    ))
+                }
+                try emitWrite(lhsRegister, to: accessDestination, width: width, instruction: instruction, state: &state)
+            }
+
+            state.words.append(encodeLDRX(rt: conditionFlagsRegister, offset: rflagsWordOffset))
+            emitLoadConstant(~UInt64(1), into: scratchRegister, output: &state.words)
+            state.words.append(encodeANDRegister(
+                rd: conditionFlagsRegister, rn: conditionFlagsRegister, rm: scratchRegister, is64Bit: true
+            ))
+            state.words.append(encodeORRRegister(
+                rd: conditionFlagsRegister, rn: conditionFlagsRegister, rm: savedLHSRegister
+            ))
+            state.words.append(encodeSTRX(rt: conditionFlagsRegister, offset: rflagsWordOffset))
 
         case .exchange:
             guard let destination = instruction.destination,
@@ -735,6 +833,10 @@ enum X64ARM64CodeGenerator {
 
     private static func encodeEor(rd: UInt32, rn: UInt32, rm: UInt32, is64Bit: Bool) -> UInt32 {
         (is64Bit ? 0xCA00_0000 : 0x4A00_0000) | (rm << 16) | (rn << 5) | rd
+    }
+
+    private static func encodeANDRegister(rd: UInt32, rn: UInt32, rm: UInt32, is64Bit: Bool) -> UInt32 {
+        (is64Bit ? 0x8A00_0000 : 0x0A00_0000) | (rm << 16) | (rn << 5) | rd
     }
 
     private static func encodeORRRegister(rd: UInt32, rn: UInt32, rm: UInt32) -> UInt32 {

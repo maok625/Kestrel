@@ -180,9 +180,16 @@ struct X64InstructionDecoder {
             )
         }
 
+        var decodedImmediateByteCount = shape.immediateBytes
+        if opcodeMap == .primary, opcode == 0xF6, modRM?.rawReg == 0 {
+            decodedImmediateByteCount = 1
+        } else if opcodeMap == .primary, opcode == 0xF7, modRM?.rawReg == 0 {
+            decodedImmediateByteCount = operandWidth == .word ? 2 : 4
+        }
+
         var immediate: UInt64?
-        if shape.immediateBytes > 0 {
-            immediate = try cursor.readUnsigned(shape.immediateBytes)
+        if decodedImmediateByteCount > 0 {
+            immediate = try cursor.readUnsigned(decodedImmediateByteCount)
         }
 
         let instructionBytes = Array(bytes.prefix(cursor.offset))
@@ -200,7 +207,7 @@ struct X64InstructionDecoder {
             addressWidth: addressWidth,
             modRM: modRM,
             immediate: immediate,
-            immediateByteCount: shape.immediateBytes
+            immediateByteCount: decodedImmediateByteCount
         )
     }
 
@@ -242,6 +249,7 @@ struct X64InstructionDecoder {
         case .map0F:
             if opcode == 0x05 { return InstructionShape(hasModRM: false, immediateBytes: 0, byteOperation: false) } // SYSCALL
             if opcode == 0x1F { return InstructionShape(hasModRM: true, immediateBytes: 0, byteOperation: false) }
+            if opcode == 0xBA { return InstructionShape(hasModRM: true, immediateBytes: 1, byteOperation: false) } // BT/BTS/BTR/BTC r/m, imm8
             if (0x80...0x8F).contains(opcode) { return InstructionShape(hasModRM: false, immediateBytes: 4, byteOperation: false) }
             throw X64InstructionDecoderError(kind: .unsupportedOpcode(map: map, opcode: opcode))
         case .map0F38, .map0F3A:
@@ -269,6 +277,11 @@ struct X64InstructionDecoder {
                 return InstructionShape(hasModRM: hasModRM, immediateBytes: immediate, byteOperation: false)
             }
 
+            if opcode == 0x84 || opcode == 0x85 {
+                return InstructionShape(hasModRM: true, immediateBytes: 0, byteOperation: opcode == 0x84)
+            }
+            if opcode == 0xF6 { return InstructionShape(hasModRM: true, immediateBytes: 0, byteOperation: true) }
+            if opcode == 0xF7 { return InstructionShape(hasModRM: true, immediateBytes: 0, byteOperation: false) }
             if [0x80, 0x81, 0x83].contains(opcode) {
                 let count = opcode == 0x80 || opcode == 0x83 ? 1 : (operandWidth == .word ? 2 : 4)
                 return InstructionShape(hasModRM: true, immediateBytes: count, byteOperation: opcode == 0x80)
@@ -466,12 +479,24 @@ enum X64IRValue: Sendable, Equatable {
     case immediate(value: UInt64, encodedByteCount: Int)
 }
 
+enum X64BitTestKind: Sendable, Equatable {
+    case test
+    case set
+    case reset
+    case complement
+}
+
 enum X64IROperation: Sendable, Equatable {
     case move
     case add
     case subtract
     case compare
+    case bitwiseAnd
     case bitwiseXor
+    case test
+    case bitwiseNot
+    case negate
+    case bitTest(kind: X64BitTestKind)
     case exchange
     case loadEffectiveAddress
     case noOperation
@@ -565,6 +590,25 @@ private enum X64SemanticLowerer {
                 let displacement = Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: immediate)))
                 return result(.conditionalBranch(condition: condition, displacement: displacement), nil, nil, nil)
             }
+            if opcode == 0xBA {
+                guard let groupExtension = modRM?.rawReg, (4...7).contains(groupExtension) else {
+                    throw X64InstructionDecoderError(kind: .invalidEncoding("0F BA requires ModRM /4 through /7"))
+                }
+                let kind: X64BitTestKind
+                switch groupExtension {
+                case 4: kind = .test
+                case 5: kind = .set
+                case 6: kind = .reset
+                case 7: kind = .complement
+                default: throw X64InstructionDecoderError(kind: .invalidEncoding("invalid 0F BA opcode extension"))
+                }
+                return result(
+                    .bitTest(kind: kind),
+                    try rmValue(),
+                    .immediate(value: immediate & 0xFF, encodedByteCount: 1),
+                    width
+                )
+            }
         }
 
         if (0x90...0x97).contains(opcode) {
@@ -613,6 +657,11 @@ private enum X64SemanticLowerer {
             return result(.push, nil, imm(immediate, instruction.immediateByteCount, signExtend: signExtended, targetWidth: stackWidth), stackWidth)
         }
 
+        if opcode == 0x84 || opcode == 0x85 {
+            let valueWidth: X64OperandWidth = opcode == 0x84 ? .byte : width
+            return result(.test, try rmValue(), try modRMReg(valueWidth), valueWidth)
+        }
+
         // Register/memory and register/register binary instruction forms.
         let binaryFamilies: [UInt8: X64IROperation] = [
             0x00: .add, 0x01: .add, 0x02: .add, 0x03: .add,
@@ -642,12 +691,38 @@ private enum X64SemanticLowerer {
             return result(operation, try reg(0, valueWidth), imm(immediate, encodedBytes, signExtend: signed, targetWidth: valueWidth), valueWidth)
         }
 
-        // Group 1 immediate instructions: /0 ADD, /5 SUB, /6 XOR, /7 CMP.
+        // Group 3: TEST (/0), NOT (/2), and NEG (/3). The implicit
+        // RAX/RDX multiply and divide forms remain unsupported in this slice.
+        if opcode == 0xF6 || opcode == 0xF7 {
+            guard let groupExtension = modRM?.rawReg else {
+                throw X64InstructionDecoderError(kind: .invalidEncoding("missing group-3 opcode extension"))
+            }
+            let valueWidth: X64OperandWidth = opcode == 0xF6 ? .byte : width
+            switch groupExtension {
+            case 0:
+                let signExtend = opcode == 0xF7 && valueWidth == .qword
+                return result(
+                    .test,
+                    try rmValue(),
+                    imm(immediate, instruction.immediateByteCount, signExtend: signExtend, targetWidth: valueWidth),
+                    valueWidth
+                )
+            case 2:
+                return result(.bitwiseNot, try rmValue(), nil, valueWidth)
+            case 3:
+                return result(.negate, try rmValue(), nil, valueWidth)
+            default:
+                throw X64InstructionDecoderError(kind: .invalidEncoding("group-3 opcode extension /\(groupExtension) is not in this IR slice"))
+            }
+        }
+
+        // Group 1 immediate instructions: /0 ADD, /4 AND, /5 SUB, /6 XOR, /7 CMP.
         if [0x80, 0x81, 0x83].contains(opcode) {
             guard let groupExtension = modRM?.rawReg else { throw X64InstructionDecoderError(kind: .invalidEncoding("missing group-1 opcode extension")) }
             let operation: X64IROperation
             switch groupExtension {
             case 0: operation = .add
+            case 4: operation = .bitwiseAnd
             case 5: operation = .subtract
             case 6: operation = .bitwiseXor
             case 7: operation = .compare
