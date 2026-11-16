@@ -331,14 +331,22 @@ enum X64ARM64TranslationSelfTests {
             helperAddress: helperAddress
         )
         try compare(
-            name: "Group 3 NEG byte",
+            name: "Group 3 NEG byte, non-minimum input",
             bytes: [0xF6, 0xD8],
             initial: configuredState(rflags: 0x202) { state in
                 try state.writeRegister(.rax, value: 0x81, width: .qword)
             },
             helperAddress: helperAddress
         )
-        passed.append("Group 3 NOT preserves flags and NEG matches subtraction flag semantics")
+        try compare(
+            name: "Group 3 NEG byte, signed minimum overflow",
+            bytes: [0xF6, 0xD8],
+            initial: configuredState(rflags: 0x202) { state in
+                try state.writeRegister(.rax, value: 0x80, width: .qword)
+            },
+            helperAddress: helperAddress
+        )
+        passed.append("Group 3 NOT preserves flags; NEG matches non-overflow and signed-minimum overflow semantics")
 
         try compare(
             name: "BT register immediate",

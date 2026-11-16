@@ -205,7 +205,14 @@ enum X64InterpreterSelfTests {
         }
         _ = try negMachine.run(until: haltAddress)
         try expect(negMachine.state.registerValue(.rax) == 0x7F, "NEG AL computes two's-complement byte result")
-        try expect(negMachine.state.flagIsSet(.carry) && negMachine.state.flagIsSet(.overflow), "NEG sets CF for nonzero input and OF for signed minimum")
+        try expect(negMachine.state.flagIsSet(.carry) && !negMachine.state.flagIsSet(.overflow), "NEG of nonzero non-minimum value sets CF but not OF")
+
+        var negMinimumMachine = try makeInterpreter(code: [0xF6, 0xD8, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x80, width: .qword)
+        }
+        _ = try negMinimumMachine.run(until: haltAddress)
+        try expect(negMinimumMachine.state.registerValue(.rax) == 0x80, "NEG of signed byte minimum wraps to itself")
+        try expect(negMinimumMachine.state.flagIsSet(.carry) && negMinimumMachine.state.flagIsSet(.overflow), "NEG of signed byte minimum sets CF and OF")
 
         // 12. BT-family operations use modulo indices for registers and preserve non-CF flags.
         var btMachine = try makeInterpreter(code: [0x0F, 0xBA, 0xE0, 0x03, 0xC3]) { state in
