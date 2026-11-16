@@ -653,7 +653,7 @@ final class LauncherViewModel: ObservableObject {
                 if !result.2.missingDependencyPaths.isEmpty {
                     append("Dependencies absent from this cache: \(result.2.missingDependencyPaths.prefix(12).joined(separator: ", "))")
                 }
-                append("Main-image imports resolved from cache: \(result.2.resolvedImportCount); flat lookup: \(result.2.flatLookupResolvedCount); weak lookup: \(result.2.weakLookupResolvedCount); unique unresolved cache imports: \(result.2.unresolvedImportCount)")
+                append("Main-image imports resolved from cache: \(result.2.resolvedImportCount); lazy resolver pointer slots prebound: \(result.2.lazyResolverResolvedImportCount); flat lookup: \(result.2.flatLookupResolvedCount); weak lookup: \(result.2.weakLookupResolvedCount); unique unresolved cache imports: \(result.2.unresolvedImportCount)")
                 for dependency in result.2.unresolvedByDependency.keys.sorted(by: {
                     let left = result.2.unresolvedByDependency[$0] ?? 0
                     let right = result.2.unresolvedByDependency[$1] ?? 0
@@ -692,7 +692,7 @@ final class LauncherViewModel: ObservableObject {
                             append(String(format: "    returned RAX: 0x%016llX; mapped executable: %@", returned, executable))
                         }
                     }
-                    append("Probe return values are diagnostic only and are NOT used to bind imports: dyld initialization, TLS and resolver side-effect semantics are not implemented.")
+                    append("Only successful two-level lazy probes whose RAX points to mapped executable guest memory are used to prebind the staged image. This is eager setup, not first-call lazy rebinding; resolver side effects, TLS and broader dyld initialization remain unsupported.")
                 }
                 for diagnostic in result.2.unresolvedBindingDiagnostics.prefix(24) {
                     let dependency = diagnostic.dependencyInstallName ?? "special ordinal"

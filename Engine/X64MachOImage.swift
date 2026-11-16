@@ -1144,6 +1144,10 @@ struct X64MachOLoadedImage: Sendable {
 /// export addresses or guest ABI-thunk addresses here.
 struct X64MachOSymbolResolver: Sendable {
     private(set) var addresses: [String: UInt64] = [:]
+    /// Resolver-returned implementations override ordinary exports only for lazy-bind actions.
+    private(set) var lazyAddresses: [String: UInt64] = [:]
+    /// Keys for lazy STUB_AND_RESOLVER exports must never fall back to the ordinary stub.
+    private var lazyResolverRequiredKeys: Set<String> = []
     /// Weak definitions occupy a separate namespace so BIND_SPECIAL_DYLIB_WEAK_LOOKUP
     /// cannot accidentally accept an ordinary strong export or a host ABI thunk.
     private(set) var weakAddresses: [String: UInt64] = [:]
@@ -1157,6 +1161,14 @@ struct X64MachOSymbolResolver: Sendable {
     mutating func registerIfAbsent(symbol: String, address: UInt64, installName: String? = nil) {
         let lookupKey = key(symbol: symbol, installName: installName)
         if addresses[lookupKey] == nil { addresses[lookupKey] = address }
+    }
+
+    mutating func registerLazy(symbol: String, address: UInt64, installName: String? = nil) {
+        lazyAddresses[key(symbol: symbol, installName: installName)] = address
+    }
+
+    mutating func requireLazyResolverImplementation(symbol: String, installName: String? = nil) {
+        lazyResolverRequiredKeys.insert(key(symbol: symbol, installName: installName))
     }
 
     mutating func registerWeak(symbol: String, address: UInt64, installName: String? = nil) {
@@ -1178,6 +1190,33 @@ struct X64MachOSymbolResolver: Sendable {
 
     func resolveExact(symbol: String, installName: String) -> UInt64? {
         addresses[key(symbol: symbol, installName: installName)]
+    }
+
+    /// Lazy binds prefer a resolver-returned implementation, then fall back to
+    /// the ordinary export (the stub for STUB_AND_RESOLVER).
+    func resolveLazyExact(symbol: String, installName: String) -> UInt64? {
+        let lookupKey = key(symbol: symbol, installName: installName)
+        if lazyResolverRequiredKeys.contains(lookupKey) {
+            return lazyAddresses[lookupKey]
+        }
+        return lazyAddresses[lookupKey] ?? addresses[lookupKey]
+    }
+
+    func resolveLazy(symbol: String, dependency: X64MachODylibDependency? = nil) -> UInt64? {
+        if let dependency {
+            let exactKey = key(symbol: symbol, installName: dependency.installName)
+            if lazyResolverRequiredKeys.contains(exactKey) {
+                return lazyAddresses[exactKey]
+            }
+            if let exact = lazyAddresses[exactKey] ?? addresses[exactKey] {
+                return exact
+            }
+        }
+        let globalKey = key(symbol: symbol, installName: nil)
+        if lazyResolverRequiredKeys.contains(globalKey) {
+            return lazyAddresses[globalKey]
+        }
+        return lazyAddresses[globalKey] ?? addresses[globalKey]
     }
 
     func resolveWeakExact(symbol: String, installName: String) -> UInt64? {
@@ -1386,15 +1425,24 @@ enum X64MachOLoader {
                 if action.libraryOrdinal == -3 {
                     resolvedAddress = effectiveResolver.resolveWeak(symbol: action.symbolName)
                 } else if let dependency {
-                    // Positive ordinals are strict two-level lookups. A global
-                    // flat-namespace result for the same symbol must never
-                    // satisfy a different dylib's import.
-                    resolvedAddress = effectiveResolver.resolveExact(
-                        symbol: action.symbolName,
-                        installName: dependency.installName
-                    )
+                    // Positive ordinals are strict two-level lookups. Lazy binds
+                    // prefer the resolver-returned implementation; regular binds
+                    // retain the ordinary export address (the stub).
+                    if action.stream == .lazy {
+                        resolvedAddress = effectiveResolver.resolveLazyExact(
+                            symbol: action.symbolName,
+                            installName: dependency.installName
+                        )
+                    } else {
+                        resolvedAddress = effectiveResolver.resolveExact(
+                            symbol: action.symbolName,
+                            installName: dependency.installName
+                        )
+                    }
                 } else {
-                    resolvedAddress = effectiveResolver.resolve(symbol: action.symbolName, dependency: nil)
+                    resolvedAddress = action.stream == .lazy
+                        ? effectiveResolver.resolveLazy(symbol: action.symbolName, dependency: nil)
+                        : effectiveResolver.resolve(symbol: action.symbolName, dependency: nil)
                 }
                 let bindLocation = action.location.addingReportingOverflow(slide)
                 guard !bindLocation.overflow else {

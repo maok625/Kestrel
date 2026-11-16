@@ -474,7 +474,7 @@ enum X64DyldSharedCacheSelfTests {
             try lazyMemory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
             try lazyMemory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
             let lazyImage = try X64MachOParser.parse(
-                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(bindStream: .lazy)
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(includeRegularAndLazy: true)
             )
             let lazyResolution = try X64DyldSharedCacheImportResolver.build(
                 cache: cache,
@@ -482,8 +482,9 @@ enum X64DyldSharedCacheSelfTests {
                 guestMemory: lazyMemory,
                 baseResolver: X64MachOSymbolResolver()
             )
-            try expect(lazyImage.lazyBindActions.count == 1, "lazy STUB_AND_RESOLVER fixture stream")
-            try expect(lazyResolution.resolvedImportCount == 0, "lazy STUB_AND_RESOLVER is not eagerly bound to its stub")
+            try expect(lazyImage.bindActions.count == 1 && lazyImage.lazyBindActions.count == 1, "same-symbol regular and lazy STUB_AND_RESOLVER fixture streams")
+            try expect(lazyResolution.resolvedImportCount == 1, "regular STUB_AND_RESOLVER pointer retains its stub binding")
+            try expect(lazyResolution.lazyResolverResolvedImportCount == 0, "failed guest resolver does not produce a lazy binding")
             try expect(lazyResolution.unresolvedImportCount == 1, "lazy resolver remains explicitly unresolved")
             let lazyDiagnostic = try unwrap(
                 lazyResolution.unresolvedBindingDiagnostics.first,
@@ -501,7 +502,170 @@ enum X64DyldSharedCacheSelfTests {
             try expect(lazyDiagnostic.candidateStubAddress == 0x7FFF_0000_0100, "lazy diagnostic reports the stub guest address")
             try expect(lazyDiagnostic.candidateResolverAddress == 0x7FFF_0000_0200, "lazy diagnostic reports the resolver guest address")
             try expect(lazyDiagnostic.candidateResolverIsExecutable == true, "lazy diagnostic confirms resolver is mapped executable")
-            passed.append("Lazy STUB_AND_RESOLVER imports report the exact provider, stub, executable resolver address, and guest-execution blocker without unsafe eager binding")
+            try expect(lazyResolution.lazyResolverResolvedImportCount == 0, "a resolver memory fault must not create a binding")
+            let failedProbe = try unwrap(lazyResolution.lazyResolverProbeResults.first, "failed lazy resolver probe")
+            try expect(failedProbe.status == .memoryFault, "zero-filled resolver fixture faults safely")
+            try expect(
+                lazyResolution.resolver.resolveExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == lazyDiagnostic.candidateStubAddress,
+                "regular binding retains the export stub"
+            )
+            try expect(
+                lazyResolution.resolver.resolveLazyExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == nil,
+                "failed resolver cannot fall back to the regular stub"
+            )
+            var strictLoadRejected = false
+            do {
+                _ = try X64MachOLoader.load(
+                    lazyImage,
+                    into: &lazyMemory,
+                    symbolResolver: lazyResolution.resolver,
+                    requireAllBindingsResolved: true
+                )
+            } catch {
+                strictLoadRejected = true
+            }
+            try expect(strictLoadRejected, "strict loader rejects the unresolved lazy pointer instead of patching it with the stub")
+            passed.append("Failed STUB_AND_RESOLVER remains unresolved even beside a regular bind for the same symbol")
+        }
+
+        do {
+            let url = try makeCacheFileWithExports(stubAndResolver: true)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            let lazyImage = try X64MachOParser.parse(
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(bindStream: .lazy)
+            )
+            let resolverAddress: UInt64 = 0x7FFF_0000_0200
+            var memory = try X64GuestVirtualMemory()
+            try memory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
+            try memory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readWrite)
+            try memory.writeBytes([
+                0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+                0xC3                          // ret
+            ], at: resolverAddress)
+            try memory.protect(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
+
+            let resolution = try X64DyldSharedCacheImportResolver.build(
+                cache: cache,
+                executable: lazyImage,
+                guestMemory: memory,
+                baseResolver: X64MachOSymbolResolver()
+            )
+            let probe = try unwrap(resolution.lazyResolverProbeResults.first, "non-executable lazy resolver return")
+            try expect(probe.status == .returned && probe.returnedAddress == 42, "resolver returns its diagnostic value")
+            try expect(probe.returnedAddressIsMappedExecutable == false, "integer return is not an executable guest address")
+            try expect(resolution.lazyResolverResolvedImportCount == 0, "non-executable resolver return is never registered")
+            try expect(resolution.resolver.resolveExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == nil, "non-executable result does not enter the symbol resolver")
+            try expect(resolution.unresolvedImportCount == 1, "non-executable resolver return leaves the lazy import unresolved")
+            passed.append("Lazy resolver return values are rejected unless RAX names mapped executable guest memory")
+        }
+
+        do {
+            let url = try makeCacheFileWithExports(stubAndResolver: true)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            let lazyImage = try X64MachOParser.parse(
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(bindStream: .lazy)
+            )
+            let resolverAddress: UInt64 = 0x7FFF_0000_0200
+            let unrelatedExecutableAddress: UInt64 = 0x0000_6000_0000_0000
+            var memory = try X64GuestVirtualMemory()
+            try memory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
+            try memory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readWrite)
+            try memory.writeBytes([
+                0x48, 0xB8, // movabs rax, unrelated executable address
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00,
+                0xC3
+            ], at: resolverAddress)
+            try memory.reserve(at: unrelatedExecutableAddress, byteCount: 0x1000, kind: .shared)
+            try memory.commit(at: unrelatedExecutableAddress, byteCount: 0x1000, permissions: .readWrite)
+            try memory.writeBytes([0xC3], at: unrelatedExecutableAddress)
+            try memory.protect(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
+            try memory.protect(at: unrelatedExecutableAddress, byteCount: 0x1000, permissions: .readExecute)
+
+            let resolution = try X64DyldSharedCacheImportResolver.build(
+                cache: cache,
+                executable: lazyImage,
+                guestMemory: memory,
+                baseResolver: X64MachOSymbolResolver()
+            )
+            let probe = try unwrap(resolution.lazyResolverProbeResults.first, "unrelated executable resolver return")
+            try expect(probe.status == .returned, "resolver returns normally")
+            try expect(probe.returnedAddress == unrelatedExecutableAddress, "resolver returns the unrelated executable address")
+            try expect(probe.returnedAddressIsMappedExecutable == true, "unrelated address is executable in guest memory")
+            try expect(resolution.lazyResolverResolvedImportCount == 0, "address outside cached dependency images is rejected")
+            try expect(resolution.unresolvedImportCount == 1, "lazy import remains unresolved after foreign executable return")
+            try expect(
+                resolution.resolver.resolveLazyExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == nil,
+                "foreign executable return is not registered as a lazy implementation"
+            )
+            passed.append("Lazy resolver rejects executable return addresses outside mapped shared-cache dependency images")
+        }
+
+        do {
+            let url = try makeCacheFileWithExports(stubAndResolver: true)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            let lazyImage = try X64MachOParser.parse(
+                data: X64MachOLoaderSelfTests.makeBoundThinExecutable(includeRegularAndLazy: true)
+            )
+            let resolverAddress: UInt64 = 0x7FFF_0000_0200
+            let stubAddress: UInt64 = 0x7FFF_0000_0100
+            let implementationAddress: UInt64 = 0x7FFF_0000_0300
+            var memory = try X64GuestVirtualMemory()
+            try memory.reserve(at: 0x7FFF_0000_0000, byteCount: 0x1000, kind: .shared)
+            try memory.commit(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readWrite)
+            // lea rax, [rip+0xF9] returns resolver+0x100 (the RX implementation at +0x300).
+            try memory.writeBytes([
+                0x48, 0x8D, 0x05, 0xF9, 0x00, 0x00, 0x00,
+                0xC3
+            ], at: resolverAddress)
+            try memory.protect(at: 0x7FFF_0000_0000, byteCount: 0x1000, permissions: .readExecute)
+
+            let resolution = try X64DyldSharedCacheImportResolver.build(
+                cache: cache,
+                executable: lazyImage,
+                guestMemory: memory,
+                baseResolver: X64MachOSymbolResolver()
+            )
+            let probe = try unwrap(resolution.lazyResolverProbeResults.first, "successful lazy resolver probe")
+            try expect(probe.status == .returned, "resolver returns normally")
+            try expect(probe.returnedAddress == implementationAddress, "resolver returns the expected guest implementation")
+            try expect(probe.returnedAddressIsMappedExecutable == true, "resolver implementation is executable in guest memory")
+            try expect(resolution.resolvedImportCount == 2, "regular stub and lazy implementation actions resolve")
+            try expect(resolution.lazyResolverResolvedImportCount == 1, "one lazy bind action is resolved by the guest resolver")
+            try expect(resolution.unresolvedImportCount == 0, "validated lazy resolver clears its unresolved import")
+            try expect(
+                resolution.unresolvedByDependency[lazyImage.dependencies[0].installName] == nil,
+                "resolved lazy symbol is removed from unresolved dependency summary"
+            )
+            try expect(
+                resolution.resolver.resolveExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == stubAddress,
+                "ordinary two-level map retains the non-lazy STUB_AND_RESOLVER stub"
+            )
+            try expect(
+                resolution.resolver.resolveLazyExact(symbol: "_puts", installName: lazyImage.dependencies[0].installName) == implementationAddress,
+                "lazy-only map carries the resolver-returned implementation"
+            )
+
+            let loaded = try X64MachOLoader.load(
+                lazyImage,
+                into: &memory,
+                symbolResolver: resolution.resolver,
+                requireAllBindingsResolved: true
+            )
+            try expect(loaded.boundFixupCount == 2, "regular and lazy pointer slots are both applied")
+            let regularSlot = try unwrap(lazyImage.bindActions.first, "regular bind pointer action")
+            let lazySlot = try unwrap(lazyImage.lazyBindActions.first, "lazy bind pointer action")
+            try expect(
+                try memory.readUnsigned(at: regularSlot.location, byteCount: 8) == stubAddress,
+                "regular pointer continues to reference the resolver stub"
+            )
+            try expect(
+                try memory.readUnsigned(at: lazySlot.location, byteCount: 8) == implementationAddress,
+                "lazy pointer stores the returned guest implementation address"
+            )
+            passed.append("STUB_AND_RESOLVER executes in an isolated guest snapshot and safely prebinds the lazy pointer to its executable return address")
         }
 
         do {

@@ -186,7 +186,8 @@ This remains a translator and loader prototype, not a complete application runti
 6. **Implemented and demonstrated on the M4 — sparse guest VM and demand-zero JIT integration.** The seven v0.10.3 MAP_JIT tests passed on the user's M4, including one-page demand-zero fault/retry. v0.11 adds two more native integration tests for `SYSCALL` dispatch and the imported `_write` thunk; these two require M4 confirmation.
 7. **Implemented as load-only slices — Mach-O mapping, classic rebases, and initial bind processing.** The loader maps the main `MH_EXECUTE`, registers BSS/tails for demand-zero, and handles the supported classic pointer rebase subset. v0.11 decodes regular/weak/lazy bind actions, indexes basic exports, discovers dependency candidates, and applies bindings only from explicit guest-address resolver entries. It does not recursively load dependencies, map dyld shared cache, handle chained fixups, or implement complete two-level/reexport/lazy-binding semantics.
 8. **Implemented as scaffolding — Darwin bootstrap boundary.** A small syscall subset, four imported C thunks, and a kernel-shaped `KernelArgs` stack builder exist. The next blocking stage is loading and initializing dyld (including shared-cache dependencies) so Kestrel can enter a real `__dyld_start` before eventual `LC_MAIN` transfer.
-9. **Future — complete the process contract.** Add chained fixups, robust dependency graph loading, dyld startup/shared cache, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Only after these components are in place should Kestrel attempt to execute KytyPS5.
+9. **Implemented as a bounded slice — STUB_AND_RESOLVER execution.** Positive-ordinal lazy imports can use a resolver's return only after isolated guest execution and executable-address validation; the resulting pointer is applied in the staged image. This is eager prebinding, not first-call lazy rebinding.
+10. **Future — complete the process contract.** Add chained fixups, robust dependency graph loading, dyld startup/shared cache, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Only after these components are in place should Kestrel attempt to execute KytyPS5.
 
 Each milestone should have isolated tests before the next subsystem is introduced. In particular, keep guest memory allocation separate from executable-code allocation.
 
@@ -275,6 +276,12 @@ The cache reader retains the primary cache and all validated subcache backing fi
 
 The **Analyze cached dependency segments** action remains read-only. The separate **Materialize cached dependency pages** action handles the current 4 KiB v2 format and copies the selected pages into private guest backing. It does not register cached exports or execute code. Formats other than 4 KiB slide-info v2 still fail closed.
 
+
+## v0.20.0 — bounded execution of STUB_AND_RESOLVER exports
+
+The shared-cache import resolver now executes each unique candidate resolver in a reusable, isolated guest snapshot with a private stack and bounded instruction/block budgets. Existing guest pages are write-protected in the snapshot; syscalls and host thunks are blocked. A result is accepted only when RAX names an address that is mapped and executable in the original guest address space. The implementation address is stored in a lazy-only symbol map under the import's exact declared two-level dependency, keeping ordinary binds pointed at the export stub; the staged main-image loader applies it only to matching lazy-bind pointer slots. Resolver failures and non-executable return values remain unresolved.
+
+This is an eager prebinding slice, not dyld's runtime first-call lazy-binding machinery. Only positive-ordinal two-level lazy imports are promoted by this path. A failed resolver is explicitly prevented from falling back to a regular bind's stub address. Resolver side effects are discarded with the snapshot; resolvers that require writable shared globals, TLS, syscalls, host thunks, or broader dyld process initialization remain unsupported. Flat/weak special-ordinal resolver exports and complete dyld startup are still future work.
 
 ## v0.19.0 — bounded dependency-route diagnostics
 

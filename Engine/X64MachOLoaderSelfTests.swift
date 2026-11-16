@@ -715,7 +715,8 @@ enum X64MachOLoaderSelfTests {
         weakImport: Bool = false,
         libraryOrdinal: Int = 1,
         installName: String = "/usr/lib/libSystem.B.dylib",
-        bindStream: X64MachOBindStreamKind = .regular
+        bindStream: X64MachOBindStreamKind = .regular,
+        includeRegularAndLazy: Bool = false
     ) -> Data {
         var data = makeThinExecutable()
         var dylib = Data()
@@ -745,17 +746,31 @@ enum X64MachOLoaderSelfTests {
         bind.append(contentsOf: Array("_puts".utf8) + [0])
         bind.append(contentsOf: [0x51, 0x72, 0x00, 0x90, 0x00]) // pointer type; DATA + 0; DO_BIND; DONE
 
+        let includeBothStreams = includeRegularAndLazy
+        let regularBind = bind
+        var lazyBind = bind
+        if includeBothStreams {
+            // Keep the regular pointer at DATA+0 and place the same lazy symbol at DATA+8.
+            lazyBind[lazyBind.count - 3] = 0x08
+        }
+        let hasRegularBind = bindStream == .regular || includeBothStreams
+        let hasLazyBind = bindStream == .lazy || includeBothStreams
+        let regularBindOffset = hasRegularBind ? bindOffset : 0
+        let lazyBindOffset = hasLazyBind
+            ? bindOffset + UInt32(hasRegularBind ? regularBind.count : 0)
+            : 0
+
         var dyld = Data()
         appendLE32(0x8000_0022, to: &dyld) // LC_DYLD_INFO_ONLY
         appendLE32(48, to: &dyld)
         appendLE32(0, to: &dyld) // rebase_off
         appendLE32(0, to: &dyld) // rebase_size
-        appendLE32(bindStream == .regular ? bindOffset : 0, to: &dyld)
-        appendLE32(bindStream == .regular ? UInt32(bind.count) : 0, to: &dyld)
+        appendLE32(regularBindOffset, to: &dyld)
+        appendLE32(hasRegularBind ? UInt32(regularBind.count) : 0, to: &dyld)
         appendLE32(0, to: &dyld) // weak bind offset
         appendLE32(0, to: &dyld) // weak bind size
-        appendLE32(bindStream == .lazy ? bindOffset : 0, to: &dyld)
-        appendLE32(bindStream == .lazy ? UInt32(bind.count) : 0, to: &dyld)
+        appendLE32(lazyBindOffset, to: &dyld)
+        appendLE32(hasLazyBind ? UInt32(lazyBind.count) : 0, to: &dyld)
         appendLE32(0, to: &dyld) // export offset
         appendLE32(0, to: &dyld) // export size
 
@@ -771,7 +786,15 @@ enum X64MachOLoaderSelfTests {
         if rebuilt.count < Int(bindOffset) {
             rebuilt.append(contentsOf: repeatElement(0, count: Int(bindOffset) - rebuilt.count))
         }
-        rebuilt.append(bind)
+        if hasRegularBind {
+            rebuilt.append(regularBind)
+        }
+        if hasLazyBind {
+            if rebuilt.count < Int(lazyBindOffset) {
+                rebuilt.append(contentsOf: repeatElement(0, count: Int(lazyBindOffset) - rebuilt.count))
+            }
+            rebuilt.append(lazyBind)
+        }
         return rebuilt
     }
 

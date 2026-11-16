@@ -689,6 +689,8 @@ struct X64DyldSharedCacheImportResolutionSummary: Sendable {
     let unresolvedBindingDiagnostics: [X64DyldUnresolvedBindingDiagnostic]
     let lazyResolverProbeResults: [X64DyldLazyResolverProbeResult]
     let lazyResolverProtectedPageCount: Int
+    /// Number of lazy-bind pointer actions resolved by a validated guest resolver return.
+    let lazyResolverResolvedImportCount: Int
     let unresolvedByDependency: [String: Int]
     let resolvedByDependency: [String: Int]
 }
@@ -871,6 +873,12 @@ enum X64DyldSharedCacheImportResolver {
                 return false
             }
             return permissions.contains(.execute)
+        }
+
+        func belongsToMappedCacheImageExecutableSegment(_ address: UInt64) -> Bool {
+            metadataByPath.values.contains {
+                isExecutableGuestAddress(address, in: $0) == true
+            }
         }
 
         // Build the load-order dependency closure. dyld recursively loads
@@ -1165,10 +1173,22 @@ enum X64DyldSharedCacheImportResolver {
             ))
         }
 
+        // A STUB_AND_RESOLVER lazy import must not fall back to the regular
+        // export stub if probing fails (including when a regular bind for the
+        // same symbol has already registered that stub).
+        for diagnostic in unresolvedBindingDiagnostics
+        where diagnostic.resolutionBlocker == .lazyResolverExecutionRequired
+            && diagnostic.stream == X64MachOBindStreamKind.lazy.rawValue {
+            guard let dependency = diagnostic.dependencyInstallName else { continue }
+            resolver.requireLazyResolverImplementation(
+                symbol: diagnostic.symbolName,
+                installName: dependency
+            )
+        }
+
         // Probe each unique executable resolver address once in a single
-        // isolated VM snapshot. Results are diagnostics only: dyld startup,
-        // TLS and process initialization are not yet available, so even a
-        // successful return must not be treated as a binding decision.
+        // isolated VM snapshot. Only a result that points to executable guest
+        // memory may satisfy its declared two-level lazy import.
         let resolverAddresses = Array(Set(unresolvedBindingDiagnostics.compactMap {
             $0.candidateResolverIsExecutable == true ? $0.candidateResolverAddress : nil
         })).sorted()
@@ -1185,6 +1205,89 @@ enum X64DyldSharedCacheImportResolver {
                 lazyResolverProbeResults = resolverAddresses.map {
                     .failed(address: $0, detail: "Could not create isolated resolver VM: \(error.localizedDescription)")
                 }
+            }
+        }
+
+        // Promote only successful, executable guest return addresses from
+        // positive-ordinal (two-level) lazy imports. The probe runs in an
+        // isolated snapshot, so resolver side effects are intentionally not
+        // copied back. The regular loader will apply the registered address to
+        // each matching lazy pointer in its own staged image transaction.
+        var lazyResolverResolvedImportCount = 0
+        var successfulLazyBindings: [String: (dependency: String, symbol: String, address: UInt64)] = [:]
+        var ambiguousLazyBindingKeys = Set<String>()
+
+        for diagnostic in unresolvedBindingDiagnostics
+        where diagnostic.resolutionBlocker == .lazyResolverExecutionRequired
+            && diagnostic.stream == X64MachOBindStreamKind.lazy.rawValue {
+            guard let dependency = diagnostic.dependencyInstallName,
+                  let resolverAddress = diagnostic.candidateResolverAddress,
+                  diagnostic.candidateResolverIsExecutable == true,
+                  let probe = lazyResolverProbeResults.first(where: { $0.resolverAddress == resolverAddress }),
+                  probe.status == .returned,
+                  probe.returnedAddressIsMappedExecutable == true,
+                  let implementationAddress = probe.returnedAddress,
+                  guestMemory.region(containing: implementationAddress) != nil,
+                  guestMemory.permissions(at: implementationAddress)?.contains(.execute) == true,
+                  belongsToMappedCacheImageExecutableSegment(implementationAddress) else {
+                continue
+            }
+
+            let key = "\(dependency)|\(diagnostic.symbolName)"
+            if let previous = successfulLazyBindings[key] {
+                if previous.address != implementationAddress {
+                    ambiguousLazyBindingKeys.insert(key)
+                }
+            } else {
+                successfulLazyBindings[key] = (
+                    dependency: dependency,
+                    symbol: diagnostic.symbolName,
+                    address: implementationAddress
+                )
+            }
+        }
+
+        // A duplicated diagnostic must never make an ambiguous implementation
+        // address win by iteration order.
+        for key in ambiguousLazyBindingKeys {
+            successfulLazyBindings.removeValue(forKey: key)
+        }
+
+        for (key, binding) in successfulLazyBindings {
+            let matchingActionCount = unresolvedActions.filter {
+                $0.dependency == binding.dependency
+                    && $0.action.stream == .lazy
+                    && $0.action.symbolName == binding.symbol
+            }.count
+            guard matchingActionCount > 0 else { continue }
+
+            resolver.registerLazy(
+                symbol: binding.symbol,
+                address: binding.address,
+                installName: binding.dependency
+            )
+            lazyResolverResolvedImportCount += matchingActionCount
+            resolvedImportCount += matchingActionCount
+            resolvedByDependency[binding.dependency, default: 0] += matchingActionCount
+            unresolvedKeys.remove(key)
+            unresolvedActions.removeAll {
+                $0.dependency == binding.dependency
+                    && $0.action.stream == .lazy
+                    && $0.action.symbolName == binding.symbol
+            }
+            unresolvedBindingDiagnostics.removeAll {
+                $0.dependencyInstallName == binding.dependency
+                    && $0.symbolName == binding.symbol
+                    && $0.stream == X64MachOBindStreamKind.lazy.rawValue
+            }
+        }
+
+        // Rebuild dependency diagnostics after successful lazy actions have
+        // been removed from the unresolved action set.
+        unresolvedByDependency.removeAll(keepingCapacity: true)
+        for missing in unresolvedActions {
+            if let dependency = missing.dependency {
+                unresolvedByDependency[dependency, default: []].insert(missing.action.symbolName)
             }
         }
 
@@ -1206,6 +1309,7 @@ enum X64DyldSharedCacheImportResolver {
             unresolvedBindingDiagnostics: unresolvedBindingDiagnostics,
             lazyResolverProbeResults: lazyResolverProbeResults,
             lazyResolverProtectedPageCount: lazyResolverProtectedPageCount,
+            lazyResolverResolvedImportCount: lazyResolverResolvedImportCount,
             unresolvedByDependency: unresolvedByDependency.mapValues(\.count),
             resolvedByDependency: resolvedByDependency
         )
