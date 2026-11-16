@@ -43,7 +43,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Kestrel")
                     .font(.largeTitle.bold())
-                Text("Native ARM64 launcher · experimental x86_64 translator")
+                Text("Native ARM64 launcher · experimental x86_64 guest runner")
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -173,6 +173,8 @@ struct ContentView: View {
         GroupBox("x86_64 guest pipeline (experimental)") {
             VStack(alignment: .leading, spacing: 10) {
                 LazyVGrid(columns: pipelineColumns, alignment: .leading, spacing: 8) {
+                    pipelineButton("Run x86_64 guest (direct main)", "play.fill",
+                                   enabled: model.canLaunchX64Guest, action: model.launchSelectedX64Guest)
                     pipelineButton("1. Load selected x86_64 Mach-O image", "shippingbox",
                                    enabled: model.canLoadX86MachOImage, action: model.loadSelectedX64MachOImage)
                     pipelineButton("2. Inspect x86_64 dyld shared cache", "externaldrive",
@@ -186,10 +188,10 @@ struct ContentView: View {
                     pipelineButton("6. Prepare Darwin KernelArgs stack", "rectangle.stack",
                                    enabled: model.canPrepareGuestProcessStartup, action: model.prepareGuestProcessStartup)
                 }
-                Text("Kestrel parses regular, weak and lazy dyld bind streams, indexes export tries and dependencies, discovers LC_RPATH candidates, and applies guest-address bindings. It installs a small guest C thunk set (_read, _write, _getpid, _exit), dispatches a narrow BSD SYSCALL subset, and prepares a kernel-shaped KernelArgs stack. It can inspect the x86_64 dyld shared cache, validate slide-info v2 chains, copy selected dependency pages into guest-owned memory, apply cache pointer fixups, and resolve supported two-level imports from cached export tries. This is still not a process launcher: recursive dependency initialization, all dyld symbol forms, main-image chained fixups, TLS/errno, broad syscalls and macOS framework ABI bridges remain incomplete, and LC_MAIN is not executed.")
+                Text("Kestrel now has an experimental x86_64 direct-main runner: it builds a C main(argc, argv, envp) frame and executes supported guest blocks through native AArch64 translation, including a small Darwin syscall bridge. This first launch mode is deliberately limited to freestanding MH_EXECUTE images with no dylib dependencies, bind actions or chained fixups; it bypasses dyld and does not run initializers. Normal macOS applications still require dyld startup, recursive dependency initialization, TLS/errno, broader syscalls and framework ABI support.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Steps 2–6 stay disabled until the selected x86_64 Mach-O image has loaded successfully; a failed load is rolled back and cannot be used to prepare guest process state. Step 4 needs a successful step 3, and step 5 needs step 4.")
+                Text("Load the x86_64 image before using guest launch or steps 2–6. Guest launch currently rejects ordinary dependency-linked macOS applications with an explicit dyld blocker; steps 2–5 remain the separate cache preparation and import-resolution path.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

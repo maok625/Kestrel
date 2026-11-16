@@ -177,6 +177,7 @@ final class LauncherViewModel: ObservableObject {
     @Published private(set) var hasRunningProcess = false
     @Published var canLoadX86MachOImage = false
     @Published var canPrepareGuestProcessStartup = false
+    @Published private(set) var canLaunchX64Guest = false
     @Published var canMaterializeCachedDependencies = false
     @Published var canResolveCachedImports = false
 
@@ -245,6 +246,7 @@ final class LauncherViewModel: ObservableObject {
         canMaterializeCachedDependencies = false
         canResolveCachedImports = false
         canPrepareGuestProcessStartup = false
+        canLaunchX64Guest = false
     }
 
     // MARK: Self-tests
@@ -405,6 +407,7 @@ final class LauncherViewModel: ObservableObject {
                 guestThunkResolver = thunkResolver
                 canLoadX86MachOImage = true
                 canPrepareGuestProcessStartup = true
+                canLaunchX64Guest = true
 
                 append("PASS: x86_64 Mach-O image mapped; bind streams decoded and the supported guest C thunks installed.")
                 append("Image: \(loaded.sourceName)")
@@ -717,6 +720,78 @@ final class LauncherViewModel: ObservableObject {
                 append("The main image was reloaded transactionally against guest addresses from materialized cache pages. This does not initialize dyld, resolve every symbol form, create TLS/errno, or execute LC_MAIN.")
             } catch {
                 append("CACHED IMPORT RESOLUTION FAILED (original guest memory and image retained): \(error.localizedDescription)")
+            }
+            isBusy = false
+        }
+    }
+
+    func launchSelectedX64Guest() {
+        guard !isBusy else { return }
+        guard let target,
+              let image = parsedX64MachOImage,
+              let loadedImage = loadedMachOImage,
+              let originalMemory = loadedGuestMemory else {
+            append("Load an x86_64 Mach-O image before launching the guest.")
+            return
+        }
+
+        let previousStackBase = preparedStartupState?.stackReservation.baseAddress
+        let executablePath = target.executableURL.path
+        let arguments = parseArguments(argumentsText)
+        let environment = ProcessInfo.processInfo.environment.merging(parseEnvironment(environmentText)) { _, new in new }
+        let hostThunks = guestHostThunkTable
+        isBusy = true
+
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    var memory = originalMemory
+                    if let previousStackBase {
+                        try memory.release(at: previousStackBase)
+                    }
+                    let (mainHeaderAddress, overflow) = loadedImage.preferredLoadAddress.addingReportingOverflow(loadedImage.slide)
+                    guard !overflow else {
+                        throw X64MachOFormatError(message: "The slid main Mach-O header address overflows.")
+                    }
+                    let startup = try X64GuestProcessStackBuilder.build(
+                        entryPoint: loadedImage.entryAddress,
+                        mainMachHeaderAddress: mainHeaderAddress,
+                        executablePath: executablePath,
+                        arguments: arguments,
+                        environment: environment,
+                        into: &memory
+                    )
+                    let execution = try X64GuestDirectMainLauncher.launch(
+                        image: image,
+                        loadedImage: loadedImage,
+                        startup: startup,
+                        memory: &memory,
+                        hostThunks: hostThunks
+                    )
+                    return (memory, startup, execution)
+                }.value
+
+                loadedGuestMemory = result.0
+                preparedStartupState = result.1
+                append("GUEST EXECUTION STARTED: direct-main mode bypasses dyld.")
+                append(String(format: "LC_MAIN=0x%016llX; RSP=0x%016llX; argc=%d; instructions=%d; blocks=%d",
+                              result.1.entryPoint,
+                              result.1.stackPointer - 8,
+                              result.1.argumentCount,
+                              result.2.report.instructionsExecuted,
+                              result.2.report.blocksExecuted))
+                switch result.2.report.exit {
+                case .halted:
+                    append("GUEST MAIN RETURNED: exit status \(result.2.exitStatus ?? 0).")
+                case .processExit:
+                    append("GUEST PROCESS EXIT: status \(result.2.exitStatus ?? -1).")
+                case .memoryFault(let rip):
+                    append(String(format: "GUEST MEMORY/EXECUTE FAULT at instruction RIP 0x%016llX.", rip))
+                }
+                append("Translation cache: hits=\(result.2.report.cache.hits), misses=\(result.2.report.cache.misses), compiled=\(result.2.report.cache.compilations).")
+                append("This is a freestanding direct-main prototype. It does not run dyld initializers, load dependent libraries, or provide libc/framework compatibility.")
+            } catch {
+                append("GUEST LAUNCH BLOCKED/FAILED: \(error.localizedDescription)")
             }
             isBusy = false
         }

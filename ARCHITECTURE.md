@@ -173,7 +173,7 @@ The prototype currently has:
 
 The Swift translation cache retains compiled AArch64 words, but the current C executor still copies each requested block into the single shared `MAP_JIT` arena before each execution; persistent per-block executable mappings and concurrent JIT execution are not implemented.
 
-This remains a translator and loader prototype, not a complete application runtime. It cannot launch the selected x86_64 application yet. Chained fixups, recursive dependency loading, dyld shared-cache mapping and initialization, lazy bind-on-first-call, reexport resolution, thread-local `errno`, broad Darwin syscalls, guest threads/TLS, signals, exceptions, and general macOS framework ABI coverage remain missing.
+Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling its LC_MAIN as C main(argc, argv, envp). This is a direct-main development mode, not a normal macOS process launch: it requires no dylib dependencies, bind actions or chained fixups, and it deliberately skips dyld and image initializers. Ordinary macOS applications still need chained fixups, recursive dependency loading, dyld shared-cache initialization, lazy binding, thread-local errno, broader Darwin syscalls, guest threads/TLS, signals, exceptions, and framework ABI bridges.
 
 
 ## Recommended milestones
@@ -185,9 +185,10 @@ This remains a translator and loader prototype, not a complete application runti
 5. **Complete as an initial slice — block dispatcher and translation cache.** Basic-block splitting, guest-RIP redispatch, byte-validated LRU caching, stale-code detection, explicit invalidation, and bounded execution passed 8 native dispatcher test groups on the M4.
 6. **Implemented and demonstrated on the M4 — sparse guest VM and demand-zero JIT integration.** The seven v0.10.3 MAP_JIT tests passed on the user's M4, including one-page demand-zero fault/retry. v0.11 adds two more native integration tests for `SYSCALL` dispatch and the imported `_write` thunk; these two require M4 confirmation.
 7. **Implemented as load-only slices — Mach-O mapping, classic rebases, and initial bind processing.** The loader maps the main `MH_EXECUTE`, registers BSS/tails for demand-zero, and handles the supported classic pointer rebase subset. v0.11 decodes regular/weak/lazy bind actions, indexes basic exports, discovers dependency candidates, and applies bindings only from explicit guest-address resolver entries. It does not recursively load dependencies, map dyld shared cache, handle chained fixups, or implement complete two-level/reexport/lazy-binding semantics.
-8. **Implemented as scaffolding — Darwin bootstrap boundary.** A small syscall subset, four imported C thunks, and a kernel-shaped `KernelArgs` stack builder exist. The next blocking stage is loading and initializing dyld (including shared-cache dependencies) so Kestrel can enter a real `__dyld_start` before eventual `LC_MAIN` transfer.
+8. **Implemented as scaffolding — Darwin bootstrap boundary.** A small syscall subset, four imported C thunks, and a kernel-shaped `KernelArgs` stack builder exist. The real blocking stage remains loading and initializing dyld (including shared-cache dependencies) before normal application startup.
 9. **Implemented as a bounded slice — STUB_AND_RESOLVER execution.** Positive-ordinal lazy imports can use a resolver's return only after isolated guest execution and executable-address validation; the resulting pointer is applied in the staged image. This is eager prebinding, not first-call lazy rebinding.
-10. **Future — complete the process contract.** Add chained fixups, robust dependency graph loading, dyld startup/shared cache, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Only after these components are in place should Kestrel attempt to execute KytyPS5.
+10. **Implemented as a first executable slice — direct-main guest launcher.** Freestanding no-dependency x86_64 images can enter LC_MAIN through a C-compatible call frame and execute under the native dispatcher. This deliberately bypasses dyld and is not normal macOS application startup.
+11. **Future — complete the process contract.** Add chained fixups, robust dependency graph loading, dyld startup/shared cache, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Then enable the real __dyld_start path and ordinary application launch, including KytyPS5.
 
 Each milestone should have isolated tests before the next subsystem is introduced. In particular, keep guest memory allocation separate from executable-code allocation.
 
@@ -276,6 +277,12 @@ The cache reader retains the primary cache and all validated subcache backing fi
 
 The **Analyze cached dependency segments** action remains read-only. The separate **Materialize cached dependency pages** action handles the current 4 KiB v2 format and copies the selected pages into private guest backing. It does not register cached exports or execute code. Formats other than 4 KiB slide-info v2 still fail closed.
 
+
+## v0.21.0 — first executable x86_64 direct-main launcher
+
+The SwiftUI pipeline now exposes a guest Launch action. For a freestanding x86_64 MH_EXECUTE with no LC_LOAD_DYLIB dependencies, classic bind actions, unresolved imports or chained fixups, Kestrel builds the Darwin argument/environment stack, installs a CALL-compatible x86_64 C main(argc, argv, envp) frame at LC_MAIN, and runs it through the native AArch64 block dispatcher. Main's RAX return value becomes the process status; Darwin SYSCALL exits and the current small host-I/O bridge are also dispatched. Instruction and block budgets bound execution, and unsupported instructions or guest faults are surfaced in the launcher log.
+
+This mode intentionally bypasses dyld. It does not call dependent-image initializers, process libc startup, or claim compatibility with ordinary macOS applications. It provides the first end-to-end guest execution/debug loop while the real __dyld_start path is developed. The runtime self-tests include a freestanding Mach-O that returns a status, a guest that writes to host stdout, the C entry stack ABI, and fail-closed rejection of dependency-linked images.
 
 ## v0.20.0 — bounded execution of STUB_AND_RESOLVER exports
 
