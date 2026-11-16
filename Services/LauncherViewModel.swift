@@ -556,7 +556,8 @@ final class LauncherViewModel: ObservableObject {
                     }
                     let plan = try X64DyldSharedCacheImageMapper.makePlan(
                         cache: cache,
-                        dependencies: mappingDependencies
+                        dependencies: mappingDependencies,
+                        additionalImages: dyldEntry.map { [$0.imageRecord] } ?? []
                     )
                     return (cache, plan, dependencyClosure, dyldEntry)
                 }.value

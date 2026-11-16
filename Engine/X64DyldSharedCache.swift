@@ -72,6 +72,10 @@ struct X64DyldSharedCacheSummary: Sendable {
     let cacheType: UInt64
     let sharedRegionStart: UInt64
     let sharedRegionSize: UInt64
+    /// Unslid address of the cache's x86_64 dyld Mach-O header (dyld_cache_header.dyldInCacheMH).
+    let dyldInCacheMachHeaderAddress: UInt64
+    /// Unslid address of the cache's x86_64 __dyld_start entry (dyld_cache_header.dyldInCacheEntry).
+    let dyldInCacheEntryPoint: UInt64
     let mappings: [X64DyldSharedCacheMapping]
     let slideMappings: [X64DyldSharedCacheSlideMapping]
     let images: [X64DyldSharedCacheImageRecord]
@@ -378,6 +382,8 @@ enum X64DyldSharedCacheReader {
             cacheType: readLE64(primaryData, at: 104),
             sharedRegionStart: readLE64(primaryData, at: 224),
             sharedRegionSize: readLE64(primaryData, at: 232),
+            dyldInCacheMachHeaderAddress: readLE64(primaryData, at: 120),
+            dyldInCacheEntryPoint: readLE64(primaryData, at: 128),
             mappings: allMappings,
             slideMappings: allSlideMappings,
             images: images.sorted { $0.installName < $1.installName },
@@ -840,11 +846,34 @@ enum X64DyldSharedCacheDylinkerReader {
         let initialProtection: UInt32
 
         var virtualEnd: UInt64 { virtualAddress + virtualSize }
-        var fileEnd: UInt64 { fileOffset + fileSize }
         var isExecutable: Bool { (initialProtection & 0x4) != 0 }
     }
 
     static func find(in cache: X64DyldSharedCacheSummary) throws -> X64DyldSharedCacheDylinkerEntry? {
+        let cacheHeader = cache.dyldInCacheMachHeaderAddress
+        let cacheEntry = cache.dyldInCacheEntryPoint
+        if cacheHeader != 0 || cacheEntry != 0 {
+            guard cacheHeader != 0, cacheEntry != 0 else {
+                throw X64DyldSharedCacheError.malformed(
+                    "The x86_64 dyld cache header contains only one of dyldInCacheMH and dyldInCacheEntry; refusing a partial dyld-in-cache record."
+                )
+            }
+            let existing = cache.images.first {
+                $0.installName == "/usr/lib/dyld" && $0.machHeaderAddress == cacheHeader
+            }
+            let image = existing ?? X64DyldSharedCacheImageRecord(
+                installName: "/usr/lib/dyld",
+                machHeaderAddress: cacheHeader,
+                modificationTime: 0,
+                inode: 0,
+                cpuType: cpuTypeX86_64,
+                fileType: fileTypeDylinker
+            )
+            return try parse(cache: cache, image: image, preferredEntryPoint: cacheEntry)
+        }
+
+        // Older cache layouts may not populate the dedicated dyld-in-cache
+        // fields. Retain exact image-table discovery as a compatibility path.
         let candidates = cache.images.filter {
             $0.hasReadableX86_64Header && $0.fileType == fileTypeDylinker
         }
@@ -863,12 +892,13 @@ enum X64DyldSharedCacheDylinkerReader {
             throw X64DyldSharedCacheError.malformed("The x86_64 shared cache contains multiple MH_DYLINKER candidates and none is the canonical /usr/lib/dyld image: \(names).")
         }
 
-        return try parse(cache: cache, image: selected)
+        return try parse(cache: cache, image: selected, preferredEntryPoint: nil)
     }
 
     private static func parse(
         cache: X64DyldSharedCacheSummary,
-        image: X64DyldSharedCacheImageRecord
+        image: X64DyldSharedCacheImageRecord,
+        preferredEntryPoint: UInt64?
     ) throws -> X64DyldSharedCacheDylinkerEntry {
         let header = try cache.readVMBytes(atVMAddress: image.machHeaderAddress, count: machHeaderSize)
         guard readLE32(header, 0) == machMagic64,
@@ -979,7 +1009,6 @@ enum X64DyldSharedCacheDylinkerReader {
             default:
                 break
             }
-
             cursor += Int(commandSize)
         }
 
@@ -992,7 +1021,9 @@ enum X64DyldSharedCacheDylinkerReader {
         }
 
         let entryPoint: UInt64
-        if let threadEntryPoint {
+        if let preferredEntryPoint {
+            entryPoint = preferredEntryPoint
+        } else if let threadEntryPoint {
             entryPoint = threadEntryPoint
         } else if let mainEntryOffset {
             guard let segment = segments.first(where: {
@@ -1007,7 +1038,7 @@ enum X64DyldSharedCacheDylinkerReader {
             }
             entryPoint = address
         } else {
-            throw X64DyldSharedCacheError.malformed("Cached x86_64 MH_DYLINKER has neither an x86_THREAD_STATE64 LC_UNIXTHREAD entry nor LC_MAIN.")
+            throw X64DyldSharedCacheError.malformed("Cached x86_64 MH_DYLINKER has no usable cache-header, LC_UNIXTHREAD, or LC_MAIN entrypoint.")
         }
 
         guard executableSegments.contains(where: {
@@ -1017,10 +1048,18 @@ enum X64DyldSharedCacheDylinkerReader {
         }
 
         return X64DyldSharedCacheDylinkerEntry(
-            installName: image.installName,
+            installName: "/usr/lib/dyld",
             machHeaderAddress: image.machHeaderAddress,
             entryPoint: entryPoint,
-            executableSegments: executableSegments.map { $0.virtualAddress..<$0.virtualEnd }
+            executableSegments: executableSegments.map { $0.virtualAddress..<$0.virtualEnd },
+            imageRecord: X64DyldSharedCacheImageRecord(
+                installName: "/usr/lib/dyld",
+                machHeaderAddress: image.machHeaderAddress,
+                modificationTime: image.modificationTime,
+                inode: image.inode,
+                cpuType: cpuTypeX86_64,
+                fileType: fileTypeDylinker
+            )
         )
     }
 
@@ -1139,9 +1178,21 @@ enum X64DyldSharedCacheImageMapper {
     static func makePlan(
         cache: X64DyldSharedCacheSummary,
         dependencies: [X64MachODylibDependency],
+        additionalImages: [X64DyldSharedCacheImageRecord] = [],
         maximumVirtualBytes: UInt64 = 16 * 1024 * 1024 * 1024
     ) throws -> X64DyldSharedCacheMappingPlan {
-        let matches = cache.matchDependencies(dependencies)
+        // Additional images are used for cache-header-owned images such as
+        // dyld itself, which need not appear in the ordinary image-info array.
+        let imagesByPath = Dictionary(
+            (additionalImages + cache.images).map { ($0.installName, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let matches = dependencies.map { dependency in
+            X64DyldSharedCacheDependencyMatch(
+                installName: dependency.installName,
+                image: imagesByPath[dependency.installName]
+            )
+        }
         guard !matches.isEmpty else {
             throw X64DyldSharedCacheError.malformed("The executable has no dependency images to inspect.")
         }

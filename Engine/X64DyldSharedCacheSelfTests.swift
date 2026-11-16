@@ -22,8 +22,12 @@ enum X64DyldSharedCacheSelfTests {
             let cache = try X64DyldSharedCacheReader.open(url)
             let dyld = try unwrap(X64DyldSharedCacheDylinkerReader.find(in: cache), "x86_64 MH_DYLINKER discovery")
             try expect(dyld.installName == "/usr/lib/dyld", "canonical dyld install name")
+            try expect(dyld.imageRecord.installName == "/usr/lib/dyld", "canonical mapping record is synthesized from cache-header metadata")
+            try expect(!cache.images.contains(where: { $0.installName == "/usr/lib/dyld" }), "dyld need not be present in the image-info array")
+            try expect(cache.dyldInCacheMachHeaderAddress == 0x7FFF_0000_0000, "dyldInCacheMH header address")
+            try expect(cache.dyldInCacheEntryPoint == 0x7FFF_0000_0100, "dyldInCacheEntry header entrypoint")
             try expect(dyld.machHeaderAddress == 0x7FFF_0000_0000, "dyld mach_header address")
-            try expect(dyld.entryPoint == 0x7FFF_0000_0100, "LC_UNIXTHREAD x86_64 RIP entrypoint")
+            try expect(dyld.entryPoint == 0x7FFF_0000_0100, "cache-header __dyld_start entrypoint overrides LC_UNIXTHREAD")
             try expect(dyld.executableSegments.contains(where: { dyld.entryPoint >= $0.lowerBound && dyld.entryPoint < $0.upperBound }), "dyld entry is inside executable segment")
 
             let syntheticDependency = X64MachODylibDependency(
@@ -34,11 +38,32 @@ enum X64DyldSharedCacheSelfTests {
                 compatibilityVersion: 0,
                 kind: .load
             )
-            let plan = try X64DyldSharedCacheImageMapper.makePlan(cache: cache, dependencies: [syntheticDependency])
+            let plan = try X64DyldSharedCacheImageMapper.makePlan(
+                cache: cache,
+                dependencies: [syntheticDependency],
+                additionalImages: [dyld.imageRecord]
+            )
             try expect(plan.images.count == 1, "dyld image receives a shared-cache mapping plan")
             try expect(plan.images[0].machHeaderAddress == dyld.machHeaderAddress, "dyld mapping plan uses the discovered image header")
             try expect(plan.executableSegmentCount == 1, "dyld executable segment is mapped")
             passed.append("x86_64 MH_DYLINKER is discovered, its LC_UNIXTHREAD RIP is validated, and its pages can be planned for guest mapping")
+        }
+
+        do {
+            let url = try makeCacheFileWithDylinker()
+            defer { try? FileManager.default.removeItem(at: url) }
+            var data = try Data(contentsOf: url)
+            data.writeLE64(0, at: 120) // clear dyldInCacheMH but leave dyldInCacheEntry
+            try data.write(to: url, options: .atomic)
+            let cache = try X64DyldSharedCacheReader.open(url)
+            var rejected = false
+            do {
+                _ = try X64DyldSharedCacheDylinkerReader.find(in: cache)
+            } catch {
+                rejected = error.localizedDescription.contains("only one of dyldInCacheMH and dyldInCacheEntry")
+            }
+            try expect(rejected, "partial dyld-in-cache header is rejected without image-table fallback")
+            passed.append("Partial dyld-in-cache header coordinates fail closed instead of guessing an MH_DYLINKER from image metadata")
         }
 
         do {
@@ -1137,7 +1162,8 @@ enum X64DyldSharedCacheSelfTests {
         let url = try makeCacheFile()
         var data = try Data(contentsOf: url)
         let base: UInt64 = 0x7FFF_0000_0000
-        writeImageInfo(&data, offset: 0x500, address: base, pathOffset: 0x700, path: "/usr/lib/dyld")
+        data.writeLE64(base, at: 120) // dyldInCacheMH: image is not required in the image-info array
+        data.writeLE64(base + 0x100, at: 128) // dyldInCacheEntry: __dyld_start
 
         let header = 0x1000
         data.writeLE32(0x7, at: header + 12) // MH_DYLINKER
