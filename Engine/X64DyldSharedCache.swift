@@ -817,6 +817,9 @@ struct X64DyldSharedCacheDylinkerEntry: Sendable, Equatable {
     let machHeaderAddress: UInt64
     let entryPoint: UInt64
     let executableSegments: [Range<UInt64>]
+    /// Exact mapper input for /usr/lib/dyld, synthesized from the cache header
+    /// when the dynamic linker is not in the ordinary image-info array.
+    let imageRecord: X64DyldSharedCacheImageRecord
 }
 
 /// Finds the real x86_64 dynamic linker in the Rosetta shared cache and reads
