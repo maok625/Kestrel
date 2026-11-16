@@ -274,7 +274,15 @@ enum X64DarwinRuntimeSelfTests {
                 installName: "/usr/lib/dyld",
                 machHeaderAddress: dyldAddress,
                 entryPoint: dyldAddress,
-                executableSegments: [dyldAddress..<(dyldAddress + 0x1000)]
+                executableSegments: [dyldAddress..<(dyldAddress + 0x1000)],
+                imageRecord: X64DyldSharedCacheImageRecord(
+                    installName: "/usr/lib/dyld",
+                    machHeaderAddress: dyldAddress,
+                    modificationTime: 0,
+                    inode: 0,
+                    cpuType: 0x0100_0007,
+                    fileType: 0x7
+                )
             )
             let startup = try X64GuestProcessStackBuilder.build(
                 entryPoint: loaded.entryAddress,
