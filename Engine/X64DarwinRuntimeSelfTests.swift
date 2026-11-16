@@ -262,13 +262,14 @@ enum X64DarwinRuntimeSelfTests {
             let loaded = try X64MachOLoader.load(image, into: &memory)
             let dyldAddress: UInt64 = 0x6_F000_0000
             try memory.reserve(at: dyldAddress, byteCount: 0x1000, kind: .shared)
-            try memory.commit(at: dyldAddress, byteCount: 0x1000, permissions: .readExecute)
+            try memory.commit(at: dyldAddress, byteCount: 0x1000, permissions: .readWrite)
             var dyldCode: [UInt8] = [0x48, 0xB8] // movabs rax, <LC_MAIN>
             for shift in stride(from: 0, to: 64, by: 8) {
                 dyldCode.append(UInt8(truncatingIfNeeded: loaded.entryAddress >> shift))
             }
             dyldCode.append(contentsOf: [0xFF, 0xE0]) // jmp rax
             try memory.writeBytes(dyldCode, at: dyldAddress)
+            try memory.protect(at: dyldAddress, byteCount: 0x1000, permissions: .readExecute)
             let dyld = X64DyldSharedCacheDylinkerEntry(
                 installName: "/usr/lib/dyld",
                 machHeaderAddress: dyldAddress,

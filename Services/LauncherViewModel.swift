@@ -938,7 +938,7 @@ final class LauncherViewModel: ObservableObject {
     func continueSelectedX64GuestAfterDyld() {
         guard !isBusy else { return }
         guard canContinueX64GuestAfterDyld,
-              var state = postDyldCPUState,
+              let state = postDyldCPUState,
               let loadedImage = loadedMachOImage,
               let startup = preparedStartupState,
               let originalMemory = loadedGuestMemory else {
@@ -946,19 +946,21 @@ final class LauncherViewModel: ObservableObject {
             return
         }
         let hostThunks = guestHostThunkTable
+        let initialState = state
         isBusy = true
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
                     var memory = originalMemory
+                    var guestState = initialState
                     let report = try X64GuestDyldLauncher.continueFromMain(
-                        state: &state,
+                        state: &guestState,
                         loadedImage: loadedImage,
                         startup: startup,
                         memory: &memory,
                         hostThunks: hostThunks
                     )
-                    return (memory, state, report)
+                    return (memory, guestState, report)
                 }.value
                 loadedGuestMemory = result.0
                 postDyldCPUState = result.1
