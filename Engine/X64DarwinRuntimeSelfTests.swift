@@ -166,7 +166,7 @@ enum X64DarwinRuntimeSelfTests {
             var state = X64CPUState()
             try startup.installDirectMainEntry(into: &state, memory: &memory)
             try expect(state.rip == startup.entryPoint, "direct-main RIP")
-            try expect(state.registerValue(.rdi) == 4, "main argc includes argv[0]")
+            try expect(state.registerValue(.rdi) == 3, "main argc includes argv[0]")
             try expect(state.registerValue(.rsi) == startup.argvPointer, "main argv register")
             try expect(state.registerValue(.rdx) == startup.envpPointer, "main envp register")
             try expect(state.registerValue(.rsp) % 16 == 8, "SysV callee-entry stack alignment")
