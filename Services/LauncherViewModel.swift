@@ -494,11 +494,11 @@ final class LauncherViewModel: ObservableObject {
             do {
                 let planned = try await Task.detached(priority: .userInitiated) {
                     let cache = try X64DyldSharedCacheReader.discoverDefault()
-                    let reexportSelection = try X64DyldSharedCacheReexportPlanner.select(
+                    let dependencyClosure = try X64DyldSharedCacheDependencyClosurePlanner.select(
                         cache: cache,
                         roots: dependencies
                     )
-                    let mappingDependencies = reexportSelection.installNames.enumerated().map { index, installName in
+                    let mappingDependencies = dependencyClosure.installNames.enumerated().map { index, installName in
                         X64MachODylibDependency(
                             ordinal: index + 1,
                             installName: installName,
@@ -512,23 +512,26 @@ final class LauncherViewModel: ObservableObject {
                         cache: cache,
                         dependencies: mappingDependencies
                     )
-                    return (cache, plan, reexportSelection)
+                    return (cache, plan, dependencyClosure)
                 }.value
                 let cache = planned.0
                 let plan = planned.1
-                let reexportSelection = planned.2
+                let dependencyClosure = planned.2
                 inspectedDyldSharedCache = cache
                 plannedDyldSharedCacheMappings = plan
                 let withinMaterializationLimit = plan.totalPageRoundedReservationBytes <= LauncherViewModel.materializationLimitBytes
-                canMaterializeCachedDependencies = withinMaterializationLimit
-                append("PASS: cached dependency and reexport-provider mapping preflight completed.")
-                append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependency images: \(reexportSelection.rootImageCount); additional reexport providers: \(max(0, plan.images.count - reexportSelection.rootImageCount))")
-                append("Reexport metadata parsed: \(reexportSelection.parsedExportCount) exports from \(reexportSelection.exportTrieBytes) bytes of export tries.")
-                if reexportSelection.truncated {
-                    append("WARNING: reexport-provider selection reached a safety limit (1,024 images or 4,096 queued names); imports from later providers may remain unresolved.")
+                canMaterializeCachedDependencies = withinMaterializationLimit && dependencyClosure.isComplete
+                append("PASS: recursive shared-cache dependency closure and mapping preflight completed.")
+                append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependencies: \(dependencyClosure.rootImageCount); transitive dependencies: \(dependencyClosure.transitiveImageCount)")
+                append("Dependency metadata parsed: \(dependencyClosure.parsedExportCount) exports from \(dependencyClosure.exportTrieBytes) bytes of export tries.")
+                if dependencyClosure.truncated {
+                    append("BLOCKED: recursive dependency closure reached its safety limit (1,024 mapped images or 8,192 queued names); the mapped set is incomplete.")
                 }
-                if !reexportSelection.missingInstallNames.isEmpty {
-                    append("Reexport providers absent from this cache: \(reexportSelection.missingInstallNames.prefix(12).joined(separator: ", "))")
+                if !dependencyClosure.missingRequiredInstallNames.isEmpty {
+                    append("BLOCKED: required dependencies absent from the x86_64 cache: \(dependencyClosure.missingRequiredInstallNames.prefix(16).joined(separator: ", "))")
+                }
+                if !dependencyClosure.missingWeakInstallNames.isEmpty {
+                    append("Optional weak dependencies absent from this cache: \(dependencyClosure.missingWeakInstallNames.prefix(16).joined(separator: ", "))")
                 }
                 append("Cache VM mappings available: \(plan.reservedMappingCount); segment commands validated: \(plan.totalSegmentCount)")
                 append("Executable segments inventoried: \(plan.executableSegmentCount); __LINKEDIT segments: \(plan.linkeditSegmentCount)")
@@ -555,7 +558,11 @@ final class LauncherViewModel: ObservableObject {
                         append(String(format: "    %@ exact 0x%016llX + 0x%llX; guest pages 0x%016llX + 0x%llX; segment prot max=0x%X init=0x%X", segment.name, segment.virtualAddress, segment.virtualSize, segment.pageRoundedAddress, segment.pageRoundedSize, segment.maximumProtection, segment.initialProtection))
                     }
                 }
-                append("PREFLIGHT COMPLETE: direct dependency pages and their declared reexport-provider pages are covered by cache mappings. The next action copies the selected pages into guest-owned backing, applies validated slide-info v2 fixups, then installs cache mapping protections. Ordinary LC_LOAD_DYLIB edges are not recursively materialized.")
+                if dependencyClosure.isComplete {
+                    append("PREFLIGHT COMPLETE: all discovered required cache-backed dependencies have validated segment mappings, including ordinary transitive LC_LOAD_DYLIB edges. The next action copies their pages into guest-owned backing, applies slide-info v2 fixups, then installs cache mapping protections.")
+                } else {
+                    append("PREFLIGHT INCOMPLETE: do not materialize this partial closure as a launchable process. Resolve the missing or truncated dependency set first.")
+                }
             } catch {
                 append("DYLD CACHE MAPPING PREFLIGHT FAILED: \(error.localizedDescription)")
             }

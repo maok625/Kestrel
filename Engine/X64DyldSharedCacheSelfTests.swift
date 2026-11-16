@@ -737,6 +737,59 @@ enum X64DyldSharedCacheSelfTests {
         }
 
         do {
+            // The executable depends on the AVFoundation parent image. Its
+            // ordinary LC_LOAD_DYLIB edge pulls in AVFCapture transitively;
+            // this must be mapped even though it is not a reexport provider.
+            let url = try makeCacheFileWithLoadCommandReexport(reexport: false)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let cache = try X64DyldSharedCacheReader.open(url)
+            let parentPath = "/System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation"
+            let providerPath = "/System/Library/PrivateFrameworks/AVFCapture.framework/Versions/A/AVFCapture"
+            let roots = [
+                X64MachODylibDependency(
+                    ordinal: 1,
+                    installName: parentPath,
+                    timestamp: 0,
+                    currentVersion: 0,
+                    compatibilityVersion: 0,
+                    kind: .load
+                )
+            ]
+
+            let selection = try X64DyldSharedCacheDependencyClosurePlanner.select(cache: cache, roots: roots)
+            try expect(selection.installNames == [parentPath, providerPath], "ordinary transitive dependency is included")
+            try expect(selection.rootImageCount == 1 && selection.transitiveImageCount == 1, "direct and transitive image counts")
+            try expect(selection.isComplete && selection.missingWeakInstallNames.isEmpty, "complete recursive cache closure")
+
+            let mappingDependencies = selection.installNames.enumerated().map { index, installName in
+                X64MachODylibDependency(
+                    ordinal: index + 1,
+                    installName: installName,
+                    timestamp: 0,
+                    currentVersion: 0,
+                    compatibilityVersion: 0,
+                    kind: .load
+                )
+            }
+            let plan = try X64DyldSharedCacheImageMapper.makePlan(cache: cache, dependencies: mappingDependencies)
+            try expect(plan.images.count == 2, "both direct and transitive dylibs receive mapping plans")
+            try expect(plan.totalPageRoundedReservationBytes == 0x3000, "transitive dependency pages are included")
+
+            let missingWeakRoot = X64MachODylibDependency(
+                ordinal: 1,
+                installName: "/usr/lib/libOptionalKestrelFixture.dylib",
+                timestamp: 0,
+                currentVersion: 0,
+                compatibilityVersion: 0,
+                kind: .weakLoad
+            )
+            let weakSelection = try X64DyldSharedCacheDependencyClosurePlanner.select(cache: cache, roots: [missingWeakRoot])
+            try expect(weakSelection.missingRequiredInstallNames.isEmpty, "missing weak dependency is not classified as required")
+            try expect(weakSelection.missingWeakInstallNames == [missingWeakRoot.installName], "missing weak dependency is reported explicitly")
+            passed.append("Recursive cache closure includes ordinary transitive dylibs and distinguishes optional weak misses")
+        }
+
+        do {
             let url = try makeCacheFileWithLoadCommandReexport(reexport: false)
             defer { try? FileManager.default.removeItem(at: url) }
             let cache = try X64DyldSharedCacheReader.open(url)

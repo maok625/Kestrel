@@ -352,6 +352,132 @@ enum X64DyldSharedCacheReexportPlanner {
     }
 }
 
+// MARK: - Complete cache-backed dylib dependency closure
+
+/// The cache images whose mappings are required by the executable's declared
+/// dylib load graph. Unlike the reexport-only provider selection used by the
+/// symbol resolver, this follows ordinary load edges as well: transitive
+/// dependencies need executable guest pages before their exports can be bound
+/// or their code can run.
+struct X64DyldSharedCacheDependencyClosureSelection: Sendable, Equatable {
+    let installNames: [String]
+    let rootImageCount: Int
+    let missingRequiredInstallNames: [String]
+    let missingWeakInstallNames: [String]
+    let parsedExportCount: Int
+    let exportTrieBytes: Int
+    let truncated: Bool
+
+    var transitiveImageCount: Int { max(0, installNames.count - rootImageCount) }
+    var isComplete: Bool { !truncated && missingRequiredInstallNames.isEmpty }
+}
+
+/// Builds a deterministic breadth-first closure from the executable's direct
+/// dependencies. Every LC_LOAD_DYLIB-family edge is traversed (including
+/// reexports, upward and lazy loads); missing weak-load images are reported
+/// separately because dyld may legitimately continue without them.
+///
+/// The planner intentionally uses exact install names and refuses basename
+/// guessing. @rpath/@loader_path expansion and images outside the selected
+/// shared cache remain explicit blockers rather than being silently mapped to
+/// an unrelated image.
+enum X64DyldSharedCacheDependencyClosurePlanner {
+    private static let maximumImages = 1_024
+    private static let maximumQueuedImages = 8_192
+    private static let maximumExportBytes = 128 * 1024 * 1024
+    private static let maximumExportCount = 2_000_000
+
+    static func select(
+        cache: X64DyldSharedCacheSummary,
+        roots: [X64MachODylibDependency]
+    ) throws -> X64DyldSharedCacheDependencyClosureSelection {
+        guard !roots.isEmpty else {
+            throw X64DyldSharedCacheError.malformed("The executable has no declared dylib dependencies to load from the shared cache.")
+        }
+
+        let imageByPath = Dictionary(
+            cache.images.map { ($0.installName, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let rootPaths = Set(roots.map(\.installName))
+        var queue: [String] = []
+        var queueIndex = 0
+        var discoveredPaths = Set<String>()
+        var requiredPaths = Set<String>()
+        var weakPaths = Set<String>()
+        var unavailablePaths = Set<String>()
+        var selectedPaths: [String] = []
+        var parsedExportBytes = 0
+        var parsedExportCount = 0
+        var truncated = false
+
+        func enqueue(_ dependency: X64MachODylibDependency) {
+            if dependency.kind == .weakLoad {
+                weakPaths.insert(dependency.installName)
+            } else {
+                requiredPaths.insert(dependency.installName)
+            }
+            guard discoveredPaths.insert(dependency.installName).inserted else { return }
+            guard queue.count < maximumQueuedImages else {
+                truncated = true
+                return
+            }
+            queue.append(dependency.installName)
+        }
+
+        for dependency in roots { enqueue(dependency) }
+
+        while queueIndex < queue.count {
+            let installName = queue[queueIndex]
+            queueIndex += 1
+
+            guard selectedPaths.count < maximumImages else {
+                truncated = true
+                break
+            }
+            guard let image = imageByPath[installName], image.hasReadableX86_64Header else {
+                unavailablePaths.insert(installName)
+                continue
+            }
+
+            let metadata = try X64DyldSharedCacheImageMetadataReader.read(cache: cache, image: image)
+            let (nextBytes, bytesOverflow) = parsedExportBytes.addingReportingOverflow(metadata.exportTrieByteCount)
+            let (nextExports, exportsOverflow) = parsedExportCount.addingReportingOverflow(metadata.exports.count)
+            guard !bytesOverflow, !exportsOverflow,
+                  nextBytes <= maximumExportBytes,
+                  nextExports <= maximumExportCount else {
+                throw X64DyldSharedCacheError.malformed("Recursive dependency metadata exceeds Kestrel's bounded export parsing limits.")
+            }
+            parsedExportBytes = nextBytes
+            parsedExportCount = nextExports
+            selectedPaths.append(installName)
+
+            // Load-command order is preserved within each breadth-first level,
+            // matching dyld's deterministic dependency discovery order.
+            for dependency in metadata.dependencies {
+                enqueue(dependency)
+            }
+        }
+
+        let missingRequired = unavailablePaths
+            .filter { requiredPaths.contains($0) }
+            .sorted()
+        let missingWeak = unavailablePaths
+            .filter { !requiredPaths.contains($0) && weakPaths.contains($0) }
+            .sorted()
+
+        return X64DyldSharedCacheDependencyClosureSelection(
+            installNames: selectedPaths,
+            rootImageCount: selectedPaths.reduce(0) { $0 + (rootPaths.contains($1) ? 1 : 0) },
+            missingRequiredInstallNames: missingRequired,
+            missingWeakInstallNames: missingWeak,
+            parsedExportCount: parsedExportCount,
+            exportTrieBytes: parsedExportBytes,
+            truncated: truncated || queueIndex < queue.count
+        )
+    }
+}
+
 enum X64DyldUnresolvedBindingReason: String, Sendable {
     case unsupportedBindType
     case noExportInDeclaredReexportChain

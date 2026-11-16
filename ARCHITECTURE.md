@@ -167,13 +167,13 @@ The prototype currently has:
 - one process-wide `MAP_JIT` arena, with write protection changed using `pthread_jit_write_protect_np` and the instruction cache invalidated before execution;
 - a bounded basic-block builder, guest-RIP dispatcher, and LRU cache with source-byte validation and explicit code invalidation APIs;
 - a load-only thin/universal x86_64 Mach-O `MH_EXECUTE` parser/mapper with sparse reservations, demand-zero BSS/tails, classic 64-bit pointer rebases for explicit PIE slides, classic regular/weak/lazy bind-action decoding, export-trie parsing, dependency/rpath metadata, guest-address import resolution, segment permissions, and rollback;
-- candidate-path discovery for dylib dependencies, without recursively loading them or the dyld shared cache;
+- exact-install-name, bounded breadth-first planning of the full cache-backed dylib dependency closure (ordinary, weak, reexport, upward, and lazy-load edges), with required misses distinguished from optional weak misses;
 - four experimental guest C import thunks (`_read`, `_write`, `_getpid`, `_exit`) and a narrow BSD syscall dispatcher;
 - a guarded kernel-shaped `KernelArgs` stack builder, with no dyld entrypoint or initial guest RIP installed.
 
 The Swift translation cache retains compiled AArch64 words, but the current C executor still copies each requested block into the single shared `MAP_JIT` arena before each execution; persistent per-block executable mappings and concurrent JIT execution are not implemented.
 
-Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling its LC_MAIN as C main(argc, argv, envp). This is a direct-main development mode, not a normal macOS process launch: it requires no dylib dependencies, bind actions or chained fixups, and it deliberately skips dyld and image initializers. Ordinary macOS applications still need chained fixups, recursive dependency loading, dyld shared-cache initialization, lazy binding, thread-local errno, broader Darwin syscalls, guest threads/TLS, signals, exceptions, and framework ABI bridges.
+Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling its LC_MAIN as C main(argc, argv, envp). This is a direct-main development mode, not a normal macOS process launch: it requires no dylib dependencies, bind actions or chained fixups, and it deliberately skips dyld and image initializers. The shared-cache path now plans the full declared recursive dependency closure, so ordinary transitive dylibs are included in the mapping plan rather than only direct dependencies and reexport providers. This is still a preparation stage: the actual dyld executable and __dyld_start handoff, uncached/@rpath loading, chained fixups, runtime initialization, thread-local errno, broader Darwin syscalls, guest threads/TLS, signals, exceptions, and framework ABI bridges remain.
 
 
 ## Recommended milestones
@@ -188,7 +188,8 @@ Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling i
 8. **Implemented as scaffolding — Darwin bootstrap boundary.** A small syscall subset, four imported C thunks, and a kernel-shaped `KernelArgs` stack builder exist. The real blocking stage remains loading and initializing dyld (including shared-cache dependencies) before normal application startup.
 9. **Implemented as a bounded slice — STUB_AND_RESOLVER execution.** Positive-ordinal lazy imports can use a resolver's return only after isolated guest execution and executable-address validation; the resulting pointer is applied in the staged image. This is eager prebinding, not first-call lazy rebinding.
 10. **Implemented as a first executable slice — direct-main guest launcher.** Freestanding no-dependency x86_64 images can enter LC_MAIN through a C-compatible call frame and execute under the native dispatcher. This deliberately bypasses dyld and is not normal macOS application startup.
-11. **Future — complete the process contract.** Add chained fixups, robust dependency graph loading, dyld startup/shared cache, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Then enable the real __dyld_start path and ordinary application launch, including KytyPS5.
+11. **Implemented as a bounded cache-loading stage — recursive dylib dependency closure.** The planner walks declared dependency edges in breadth-first load order, maps every discovered cache-backed image, enforces image/metadata limits, and distinguishes optional weak misses from required missing images. It deliberately does not guess @rpath paths or claim to initialize dyld.
+12. **Future — complete the process contract.** Add uncached and @rpath image loading, dyld image discovery/mapping and __dyld_start handoff, chained fixups, dyld runtime initialization, thread-local errno, more libSystem/syscalls, guest threads/TLS, signals/exceptions, and selected framework ABI bridges. Then run the actual KytyPS5 x86_64 executable through normal macOS startup.
 
 Each milestone should have isolated tests before the next subsystem is introduced. In particular, keep guest memory allocation separate from executable-code allocation.
 

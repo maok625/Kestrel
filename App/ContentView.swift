@@ -179,16 +179,16 @@ struct ContentView: View {
                                    enabled: model.canLoadX86MachOImage, action: model.loadSelectedX64MachOImage)
                     pipelineButton("2. Inspect x86_64 dyld shared cache", "externaldrive",
                                    enabled: model.canPrepareGuestProcessStartup, action: model.inspectX64DyldSharedCache)
-                    pipelineButton("3. Analyze cached dependency segments", "list.bullet.rectangle",
+                    pipelineButton("3. Analyze recursive dylib dependency closure", "list.bullet.rectangle",
                                    enabled: model.canPrepareGuestProcessStartup, action: model.planX64DyldSharedCacheMappings)
-                    pipelineButton("4. Materialize cached dependency pages", "square.stack.3d.up",
+                    pipelineButton("4. Materialize recursive dependency pages", "square.stack.3d.up",
                                    enabled: model.canMaterializeCachedDependencies, action: model.materializeX64DyldSharedCacheDependencies)
                     pipelineButton("5. Resolve imports from cached dylibs", "link",
                                    enabled: model.canResolveCachedImports, action: model.resolveX64MachOImportsFromCache)
                     pipelineButton("6. Prepare Darwin KernelArgs stack", "rectangle.stack",
                                    enabled: model.canPrepareGuestProcessStartup, action: model.prepareGuestProcessStartup)
                 }
-                Text("Kestrel now has an experimental x86_64 direct-main runner: it builds a C main(argc, argv, envp) frame and executes supported guest blocks through native AArch64 translation, including a small Darwin syscall bridge. This first launch mode is deliberately limited to freestanding MH_EXECUTE images with no dylib dependencies, bind actions or chained fixups; it bypasses dyld and does not run initializers. Normal macOS applications still require dyld startup, recursive dependency initialization, TLS/errno, broader syscalls and framework ABI support.")
+                Text("Kestrel now has an experimental x86_64 direct-main runner: it builds a C main(argc, argv, envp) frame and executes supported guest blocks through native AArch64 translation, including a small Darwin syscall bridge. This first launch mode is deliberately limited to freestanding MH_EXECUTE images with no dylib dependencies, bind actions or chained fixups; it bypasses dyld and does not run initializers. Normal macOS applications still require the real dyld entrypoint, uncached/@rpath image loading, chained fixups, runtime initialization, TLS/errno, broader syscalls and framework ABI support.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Load the x86_64 image before using guest launch or steps 2–6. Guest launch currently rejects ordinary dependency-linked macOS applications with an explicit dyld blocker; steps 2–5 remain the separate cache preparation and import-resolution path.")
