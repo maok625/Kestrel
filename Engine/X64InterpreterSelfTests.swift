@@ -171,6 +171,88 @@ enum X64InterpreterSelfTests {
         }
         passed.append("Out-of-range guest memory access raises a deterministic memory fault")
 
+        // 10. TEST and AND update logical flags; TEST never changes its operand.
+        var testMachine = try makeInterpreter(code: [0x48, 0x85, 0xD8, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0xF0, width: .qword)
+            try state.writeRegister(.rbx, value: 0x0F, width: .qword)
+            state.setFlag(.carry, to: true)
+            state.setFlag(.auxiliaryCarry, to: true)
+            state.setFlag(.overflow, to: true)
+        }
+        _ = try testMachine.run(until: haltAddress)
+        try expect(testMachine.state.registerValue(.rax) == 0xF0, "TEST preserves its destination")
+        try expect(!testMachine.state.flagIsSet(.carry) && !testMachine.state.flagIsSet(.overflow), "TEST clears CF and OF")
+        try expect(testMachine.state.flagIsSet(.zero) && testMachine.state.flagIsSet(.parity), "TEST sets ZF and PF from the AND result")
+        try expect(testMachine.state.flagIsSet(.auxiliaryCarry), "TEST preserves undefined AF")
+        var andMachine = try makeInterpreter(code: [0x48, 0x83, 0xE0, 0x0F, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x1234, width: .qword)
+        }
+        _ = try andMachine.run(until: haltAddress)
+        try expect(andMachine.state.registerValue(.rax) == 0x04, "Group 1 AND writes the masked result")
+        passed.append("TEST and Group 1 AND execute with correct data and logical flags")
+
+        // 11. Group 3 NOT and NEG retain their distinct flag semantics.
+        var notMachine = try makeInterpreter(code: [0xF6, 0xD0, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x1122_3344_5566_AA00, width: .qword)
+            state.setFlag(.carry, to: true)
+            state.setFlag(.zero, to: true)
+        }
+        _ = try notMachine.run(until: haltAddress)
+        try expect(notMachine.state.registerValue(.rax) == 0x1122_3344_5566_AAFF, "NOT AL inverts only the low byte")
+        try expect(notMachine.state.flagIsSet(.carry) && notMachine.state.flagIsSet(.zero), "NOT preserves all flags")
+        var negMachine = try makeInterpreter(code: [0xF6, 0xD8, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x81, width: .qword)
+        }
+        _ = try negMachine.run(until: haltAddress)
+        try expect(negMachine.state.registerValue(.rax) == 0x7F, "NEG AL computes two's-complement byte result")
+        try expect(negMachine.state.flagIsSet(.carry) && negMachine.state.flagIsSet(.overflow), "NEG sets CF for nonzero input and OF for signed minimum")
+
+        // 12. BT-family operations use modulo indices for registers and preserve non-CF flags.
+        var btMachine = try makeInterpreter(code: [0x0F, 0xBA, 0xE0, 0x03, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x08, width: .qword)
+            state.setFlag(.zero, to: true)
+            state.setFlag(.overflow, to: true)
+        }
+        _ = try btMachine.run(until: haltAddress)
+        try expect(btMachine.state.flagIsSet(.carry), "BT reports the selected old bit through CF")
+        try expect(btMachine.state.registerValue(.rax) == 0x08, "BT does not modify its operand")
+        try expect(btMachine.state.flagIsSet(.zero) && btMachine.state.flagIsSet(.overflow), "BT preserves all flags except CF")
+
+        var btsMachine = try makeInterpreter(code: [0x0F, 0xBA, 0xE8, 0x04, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x01, width: .qword)
+        }
+        _ = try btsMachine.run(until: haltAddress)
+        try expect(btsMachine.state.registerValue(.rax) == 0x11 && !btsMachine.state.flagIsSet(.carry), "BTS sets the selected bit and reports its old value")
+
+        var btrMachine = try makeInterpreter(code: [0x0F, 0xBA, 0xF0, 0x04, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x31, width: .qword)
+        }
+        _ = try btrMachine.run(until: haltAddress)
+        try expect(btrMachine.state.registerValue(.rax) == 0x21 && btrMachine.state.flagIsSet(.carry), "BTR clears the selected bit and reports its old value")
+
+        var btcMachine = try makeInterpreter(code: [0x0F, 0xBA, 0xF8, 0x01, 0xC3]) { state in
+            try state.writeRegister(.rax, value: 0x03, width: .qword)
+        }
+        _ = try btcMachine.run(until: haltAddress)
+        try expect(btcMachine.state.registerValue(.rax) == 0x01 && btcMachine.state.flagIsSet(.carry), "BTC toggles the selected bit and reports its old value")
+
+        var bitMemory = try X64GuestMemory(baseAddress: guestBase, size: memorySize)
+        try bitMemory.writeBytes([0x48, 0x0F, 0xBA, 0x2B, 0x41, 0xC3], at: codeAddress)
+        try bitMemory.writeUnsigned(0x01, at: guestBase + 0x3008, width: .qword)
+        var bitMemoryState = X64CPUState(rip: codeAddress)
+        try bitMemoryState.writeRegister(.rbx, value: guestBase + 0x3000, width: .qword)
+        try bitMemoryState.writeRegister(.rsp, value: stackTop - 8, width: .qword)
+        try bitMemory.writeUnsigned(haltAddress, at: stackTop - 8, width: .qword)
+        var bitMemoryMachine = X64Interpreter(state: bitMemoryState, memory: bitMemory)
+        _ = try bitMemoryMachine.run(until: haltAddress)
+        let updatedBitString = try bitMemoryMachine.memory.readUnsigned(at: guestBase + 0x3008, width: .qword)
+        try expect(
+            updatedBitString == 0x03,
+            "memory BTS imm8 index 65 addresses the next qword and sets bit one"
+        )
+        try expect(!bitMemoryMachine.state.flagIsSet(.carry), "memory BTS reports the previous selected bit")
+        passed.append("BT/BTS/BTR/BTC execute register and memory bit strings with CF-only updates")
+
         return passed
     }
 

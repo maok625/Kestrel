@@ -394,7 +394,7 @@ static int kestrel_even_parity(uint8_t value) {
     return (__builtin_popcount((unsigned)value) & 1) == 0;
 }
 
-/// kind: 0=ADD, 1=SUB/CMP, 2=logical XOR.
+/// kind: 0=ADD, 1=SUB/CMP/NEG, 2=logical AND/XOR/TEST.
 /// The arithmetic itself is emitted as native AArch64 instructions. This
 /// helper only writes architecturally exact x86 CF/PF/AF/ZF/SF/OF into RFLAGS.
 static void kestrel_x64_update_flags(uint64_t *context_words,

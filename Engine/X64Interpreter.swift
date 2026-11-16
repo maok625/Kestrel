@@ -193,7 +193,7 @@ struct X64Interpreter {
         var nextRIP = fallthroughRIP
 
         switch instruction.operation {
-        case .move, .add, .subtract, .compare, .bitwiseXor:
+        case .move, .add, .subtract, .compare, .bitwiseAnd, .bitwiseXor, .test:
             guard let destination = instruction.destination,
                   let source = instruction.source,
                   let width = instruction.width else {
@@ -217,13 +217,76 @@ struct X64Interpreter {
                 try write(result, to: destination, width: width, instruction: instruction)
             case .compare:
                 _ = state.subtract(lhs, rhs, width: width)
+            case .bitwiseAnd:
+                let result = (lhs & rhs) & width.mask
+                updateLogicalFlags(result, width: width)
+                try write(result, to: destination, width: width, instruction: instruction)
             case .bitwiseXor:
                 let result = (lhs ^ rhs) & width.mask
                 updateLogicalFlags(result, width: width)
                 try write(result, to: destination, width: width, instruction: instruction)
+            case .test:
+                updateLogicalFlags(lhs & rhs, width: width)
             default:
                 throw X64InterpreterError.invalidOperand("unexpected operation in arithmetic dispatch")
             }
+
+        case .bitwiseNot:
+            guard let destination = instruction.destination, let width = instruction.width else {
+                throw X64InterpreterError.invalidOperand("NOT requires a destination and width")
+            }
+            let value = try read(destination, width: width, instruction: instruction)
+            try write((~value) & width.mask, to: destination, width: width, instruction: instruction)
+
+        case .negate:
+            guard let destination = instruction.destination, let width = instruction.width else {
+                throw X64InterpreterError.invalidOperand("NEG requires a destination and width")
+            }
+            let value = try read(destination, width: width, instruction: instruction)
+            let result = state.subtract(0, value, width: width)
+            try write(result, to: destination, width: width, instruction: instruction)
+
+        case .bitTest(let kind):
+            guard let destination = instruction.destination,
+                  let source = instruction.source,
+                  let width = instruction.width,
+                  case .immediate(let encodedIndex, _) = source else {
+                throw X64InterpreterError.invalidOperand("BT/BTS/BTR/BTC requires an r/m destination, imm8 index, and width")
+            }
+            let bitIndex = Int(encodedIndex & 0xFF)
+            let bitPosition = bitIndex % width.bitCount
+            var accessDestination = destination
+            if case .memory(let memoryOperand) = destination {
+                let byteOffset = Int64((bitIndex / width.bitCount) * (width.bitCount / 8))
+                let (displacement, overflow) = memoryOperand.displacement.addingReportingOverflow(byteOffset)
+                guard !overflow else {
+                    throw X64InterpreterError.invalidOperand("bit-string memory offset overflows the decoded displacement")
+                }
+                accessDestination = .memory(X64MemoryOperand(
+                    base: memoryOperand.base,
+                    index: memoryOperand.index,
+                    scale: memoryOperand.scale,
+                    displacement: displacement,
+                    ripRelative: memoryOperand.ripRelative,
+                    addressWidth: memoryOperand.addressWidth,
+                    segmentOverride: memoryOperand.segmentOverride
+                ))
+            }
+
+            let original = try read(accessDestination, width: width, instruction: instruction)
+            let bitMask = UInt64(1) << bitPosition
+            let oldBitIsSet = (original & bitMask) != 0
+            let updated: UInt64
+            switch kind {
+            case .test: updated = original
+            case .set: updated = original | bitMask
+            case .reset: updated = original & ~bitMask
+            case .complement: updated = original ^ bitMask
+            }
+            if kind != .test {
+                try write(updated & width.mask, to: accessDestination, width: width, instruction: instruction)
+            }
+            state.setFlag(.carry, to: oldBitIsSet)
 
         case .exchange:
             guard let destination = instruction.destination,
@@ -372,7 +435,7 @@ struct X64Interpreter {
     }
 
     private mutating func updateLogicalFlags(_ result: UInt64, width: X64OperandWidth) {
-        // XOR defines CF=0, OF=0, SF/ZF/PF. AF is architecturally undefined;
+        // AND/XOR/TEST define CF=0, OF=0, SF/ZF/PF. AF is architecturally undefined;
         // retain its previous value instead of inventing a deterministic rule.
         state.setFlag(.carry, to: false)
         state.setFlag(.overflow, to: false)

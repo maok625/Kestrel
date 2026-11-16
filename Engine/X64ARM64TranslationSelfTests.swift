@@ -301,6 +301,76 @@ enum X64ARM64TranslationSelfTests {
         )
         passed.append("JBE compound predicate reads CF and ZF from the unmodified original RFLAGS")
 
+        try compare(
+            name: "TEST register operands and logical flags",
+            bytes: [0x48, 0x85, 0xD8],
+            initial: configuredState(rflags: 0xA13) { state in
+                try state.writeRegister(.rax, value: 0xF0, width: .qword)
+                try state.writeRegister(.rbx, value: 0x0F, width: .qword)
+            },
+            helperAddress: helperAddress
+        )
+        passed.append("TEST updates defined logical flags and leaves its destination untouched")
+
+        try compare(
+            name: "Group 1 AND immediate",
+            bytes: [0x48, 0x83, 0xE0, 0x0F],
+            initial: configuredState(rflags: 0x202) { state in
+                try state.writeRegister(.rax, value: 0x1234, width: .qword)
+            },
+            helperAddress: helperAddress
+        )
+        passed.append("Group 1 AND register result and flags match the interpreter")
+
+        try compare(
+            name: "Group 3 NOT byte",
+            bytes: [0xF6, 0xD0],
+            initial: configuredState(rflags: 0xA13) { state in
+                try state.writeRegister(.rax, value: 0x1122_3344_5566_AA00, width: .qword)
+            },
+            helperAddress: helperAddress
+        )
+        try compare(
+            name: "Group 3 NEG byte",
+            bytes: [0xF6, 0xD8],
+            initial: configuredState(rflags: 0x202) { state in
+                try state.writeRegister(.rax, value: 0x81, width: .qword)
+            },
+            helperAddress: helperAddress
+        )
+        passed.append("Group 3 NOT preserves flags and NEG matches subtraction flag semantics")
+
+        try compare(
+            name: "BT register immediate",
+            bytes: [0x0F, 0xBA, 0xE0, 0x03],
+            initial: configuredState(rflags: 0xA42) { state in
+                try state.writeRegister(.rax, value: 0x08, width: .dword)
+            },
+            helperAddress: helperAddress
+        )
+        try compare(
+            name: "BTS/BTR/BTC register immediate",
+            bytes: [0x0F, 0xBA, 0xE8, 0x04, 0x0F, 0xBA, 0xF0, 0x04, 0x0F, 0xBA, 0xF8, 0x01],
+            initial: configuredState(rflags: 0x202) { state in
+                try state.writeRegister(.rax, value: 0x03, width: .dword)
+            },
+            helperAddress: helperAddress
+        )
+        passed.append("BT/BTS/BTR/BTC register operations update CF and data consistently")
+
+        try compare(
+            name: "BTS qword memory bit-string offset",
+            bytes: [0x48, 0x0F, 0xBA, 0x2B, 0x41],
+            initial: configuredState(rflags: 0x202) { state in
+                try state.writeRegister(.rbx, value: dataAddress, width: .qword)
+            },
+            helperAddress: helperAddress,
+            memorySetup: { memory in
+                try memory.writeUnsigned(0x01, at: dataAddress + 8, width: .qword)
+            }
+        )
+        passed.append("Memory bit-string index 65 addresses the next qword in both engines")
+
         try verifyAllConditionalBranches(helperAddress: helperAddress)
         passed.append("All 16 x86 conditional-branch predicates match the interpreter across four flag patterns")
 
