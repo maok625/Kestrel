@@ -67,6 +67,11 @@ enum X64DarwinRuntimeSelfTests {
             try expect(memory.isCommitted(address: commpage), "fixed x86_64 commpage is committed")
             try expect(try memory.readBytes(at: commpage, count: 16) == signature, "x86_64 commpage signature")
             try expect(try memory.readUnsigned(at: commpage + 0x1E, byteCount: 2) == 14, "x86_64 commpage layout version")
+            try expect(try memory.readUnsigned(at: commpage + 0x26, byteCount: 2) == 32, "x86_64 commpage cache-line field")
+            try expect(
+                try memory.readUnsigned(at: commpage + 0x38, byteCount: 8) == ProcessInfo.processInfo.physicalMemory,
+                "x86_64 commpage host memory-size field"
+            )
             let commpageCapabilities = try memory.readUnsigned(at: commpage + 0x10, byteCount: 8)
             try expect((commpageCapabilities & (1 << 62)) != 0, "commpage marks the guest as translated")
             try expect((commpageCapabilities & (1 << 9)) != 0, "commpage reports 64-bit guest capability")
@@ -79,6 +84,7 @@ enum X64DarwinRuntimeSelfTests {
                 commpageWriteRejected = fault.access == .write
             }
             try expect(commpageWriteRejected, "guest writes to the kernel-provided commpage are rejected")
+            try X64GuestDarwinCommpage.install(into: &memory) // repeated startup preparation is idempotent
 
             passed.append("Read-only x86_64 Darwin commpage is mapped at 0x7fffffe00000 with its signature, version, and conservative capability fields")
 
