@@ -11,9 +11,34 @@ enum X64ARM64BlockExit: Equatable, Sendable {
     case missingPageFault(address: UInt64, access: X64GuestMemoryAccess)
 }
 
+struct X64ARM64NativeMemoryFault: Sendable, Equatable {
+    let guestAddress: UInt64
+    let permission: UInt8
+
+    var access: X64GuestMemoryAccess? {
+        switch permission {
+        case 0x01: return .read
+        case 0x02: return .write
+        case 0x04: return .execute
+        default: return nil
+        }
+    }
+}
+
 struct X64ARM64BlockResult {
     let arm64Words: [UInt32]
     let exit: X64ARM64BlockExit
+    let nativeMemoryFault: X64ARM64NativeMemoryFault?
+
+    init(
+        arm64Words: [UInt32],
+        exit: X64ARM64BlockExit,
+        nativeMemoryFault: X64ARM64NativeMemoryFault? = nil
+    ) {
+        self.arm64Words = arm64Words
+        self.exit = exit
+        self.nativeMemoryFault = nativeMemoryFault
+    }
 }
 
 /// Bridges Swift guest CPU/memory state to the C MAP_JIT executor. The guest
@@ -136,22 +161,33 @@ enum X64ARM64Runtime {
         restore(context, into: &state)
 
         let exit: X64ARM64BlockExit
+        let nativeMemoryFault: X64ARM64NativeMemoryFault?
         switch blockResult {
-        case 0: exit = .completed
-        case 1: exit = .controlFlow
-        case 2: exit = .memoryFault
-        case 4: exit = .systemCall
+        case 0:
+            exit = .completed
+            nativeMemoryFault = nil
+        case 1:
+            exit = .controlFlow
+            nativeMemoryFault = nil
+        case 2:
+            exit = .memoryFault
+            nativeMemoryFault = X64ARM64NativeMemoryFault(
+                guestAddress: faultAddress,
+                permission: faultPermission
+            )
+        case 4:
+            exit = .systemCall
+            nativeMemoryFault = nil
         case 3:
-            let access: X64GuestMemoryAccess
-            switch faultPermission {
-            case 0x01: access = .read
-            case 0x02: access = .write
-            case 0x04: access = .execute
-            default:
-                exit = .memoryFault
+            let fault = X64ARM64NativeMemoryFault(
+                guestAddress: faultAddress,
+                permission: faultPermission
+            )
+            guard let access = fault.access else {
                 return X64ARM64BlockResult(
                     arm64Words: words,
-                    exit: exit
+                    exit: .memoryFault,
+                    nativeMemoryFault: fault
                 )
             }
 
@@ -160,12 +196,19 @@ enum X64ARM64Runtime {
                     address: faultAddress,
                     access: access
                 )
+                nativeMemoryFault = fault
             } else {
                 exit = .memoryFault
+                nativeMemoryFault = fault
             }
-        default: throw RuntimeError.invalidBlockResult(blockResult)
+        default:
+            throw RuntimeError.invalidBlockResult(blockResult)
         }
-        return X64ARM64BlockResult(arm64Words: words, exit: exit)
+        return X64ARM64BlockResult(
+            arm64Words: words,
+            exit: exit,
+            nativeMemoryFault: nativeMemoryFault
+        )
     }
 
     /// Legacy compiled-word adapter. This exists only for tests and older
