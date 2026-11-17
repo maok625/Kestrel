@@ -79,7 +79,7 @@ Generated block result values are:
 | 0 | Normal fallthrough. |
 | 1 | Guest control-flow exit; the dispatcher continues from the guest RIP written by the block. |
 | 2 | Guest memory permission/invalid-access fault. |
-| 3 | Native page-table helper reported a missing page; Swift may demand-zero commit one permitted page and retry the unchanged faulting instruction. |
+| 3 | Native page-table helper reported a missing page; Swift may commit one permitted demand-zero or cache-backed page and retry the unchanged faulting instruction. |
 | 4 | Guest `SYSCALL` exit; the dispatcher handles the syscall outside native code. |
 
 For each native guest memory access, C helpers binary-search the sorted guest page table, validate address arithmetic, every page in the access span, committed backing, and R/W permission, and only then read or write host backing. Cross-page scalar stores are prevalidated in full before the first byte changes. Native writes update page generations and a global write count, which Swift synchronizes back to the guest VM after the block call. Instruction fetch is checked separately by Swift against guest X permission.
@@ -112,14 +112,15 @@ Memory XCHG is deliberately rejected until atomic semantics are implemented. FS/
 
 ## Sparse guest virtual-memory manager (initial implementation)
 
-`X64GuestVirtualMemory` introduces a page-based guest address space independent of the host JIT arena and independent of the old single-byte-array test fixture. It models x86-64 guest pages as 4 KiB, regardless of the host Mac's physical/virtual page size. Reservations are sparse metadata; committed pages allocate individual stable 4 KiB host backing blocks. A 4 GiB region can therefore be reserved without allocating 4 GiB of host memory.
+`X64GuestVirtualMemory` introduces a page-based guest address space independent of the host JIT arena and independent of the old single-byte-array test fixture. It models x86-64 guest pages as 4 KiB, regardless of the host Mac's physical/virtual page size. Reservations are sparse metadata; committed pages allocate individual stable 4 KiB host backing blocks. Demand-zero and cache-backed ranges remain metadata-only until accessed, so a 4 GiB region can be reserved without allocating 4 GiB of host memory.
 
 The manager currently provides:
 
 - non-overlapping page-aligned region reservations and deterministic first-fit allocation;
 - independent region kinds for anonymous, image, heap, stack, and shared mappings;
 - lazy commit, decommit, release, and zero-fill on recommit;
-- metadata-only demand-zero ranges that materialize one zero-filled 4 KiB page on first permitted read, write, or executable fetch, splitting the lazy range without preallocating per-page metadata;
+- metadata-only demand-zero ranges that materialize one zero-filled 4 KiB page on first permitted read, write, or executable fetch;
+- metadata-only cache-backed ranges that load one 4 KiB source page, apply its slide-info v2 fixups to a private copy, and commit it with the cache mapping's permissions on first permitted access;
 - per-page read, write, and execute permissions;
 - execute-only instruction-fetch validation distinct from ordinary reads;
 - access spanning page boundaries and adjacent reservations;
@@ -128,7 +129,7 @@ The manager currently provides:
 - deterministic faults for unreserved, uncommitted, or permission-denied accesses;
 - mapping, per-page, and write generations for future translation-cache coherence.
 
-The guest VM manager has its own 24-group Swift test suite. The original `X64GuestMemory` byte-array type remains available for older differential fixtures, but its runtime adapter constructs a temporary sparse VM and invokes the same page-table JIT ABI. The v0.10.3 native integration suite has seven MAP_JIT tests, including demand-zero data-fault retry. v0.11 adds two further MAP_JIT tests for the dispatcher-handled `SYSCALL` exit and imported `_write` host thunk; those new tests still require M4 execution. Permission failures and pages outside registered lazy ranges remain deterministic faults.
+The guest VM manager has a Swift self-test suite covering sparse reservations, demand-zero pages, and lazy cache-backed ranges. The original `X64GuestMemory` byte-array type remains available for older differential fixtures, but its runtime adapter constructs a temporary sparse VM and invokes the same page-table JIT ABI. The native MAP_JIT integration suite includes demand-zero and cache-backed missing-page retry paths, alongside dispatcher-handled `SYSCALL` and imported `_write` host-thunk coverage; the current additions still require M4 execution. Permission failures and pages outside registered lazy ranges remain deterministic faults.
 
 ## ABI and operating-system boundary
 
@@ -157,11 +158,11 @@ The prototype currently has:
 - width-correct register reads/writes, including AH/CH/DH/BH and REX byte-register decoding;
 - a decoder and guest-semantic IR for an explicit instruction subset, including dispatcher-boundary `SYSCALL`;
 - a legacy bounded byte-array guest-memory fixture for native differential tests;
-- a sparse multi-region guest virtual-memory manager with 4 KiB pages, lazy commitment, per-page RWX permissions, guard-page stacks, demand-zero tail metadata, and deterministic faults;
+- a sparse multi-region guest virtual-memory manager with 4 KiB pages, lazy commitment, per-page RWX permissions, guard-page stacks, demand-zero and cache-backed metadata ranges, and deterministic faults;
 - a reference interpreter for the supported non-syscall IR subset;
 - an AArch64 backend for supported register, immediate, and memory integer operations, LEA, stack operations, direct/indirect control flow, Jcc predicates, and native syscall exits;
 - a fixed 18-word guest CPU context plus a separate sparse page-table descriptor;
-- checked native guest-memory access across independent committed pages, with deterministic faults that leave the faulting instruction's RIP unchanged;
+- checked native guest-memory access across independent committed pages, with retryable missing-page faults and deterministic protection faults that leave the faulting instruction's RIP unchanged;
 - a native C helper for exact CF/PF/AF/ZF/SF/OF updates after generated integer operations;
 - a differential suite that compares GPRs, RIP, RFLAGS, and guest memory against the interpreter;
 - one process-wide `MAP_JIT` arena, with write protection changed using `pthread_jit_write_protect_np` and the instruction cache invalidated before execution;
@@ -176,6 +177,13 @@ The Swift translation cache retains compiled AArch64 words, but the current C ex
 
 Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling its LC_MAIN as C main(argc, argv, envp). This is a direct-main development mode, not a normal macOS process launch: it requires no dylib dependencies, bind actions or chained fixups, and it deliberately skips dyld and image initializers. The shared-cache path now plans the full declared recursive dependency closure, so ordinary transitive dylibs are included in the mapping plan rather than only direct dependencies and reexport providers. Kestrel now maps the x86_64 MH_DYLINKER using the Rosetta cache header’s dedicated dyld header/entry pointers, supplies dyld_path in KernelArgs, and has a bounded runner that executes __dyld_start until the main executable's LC_MAIN handoff. A separate continuation can then begin executing the real program entrypoint. This path has not yet been validated against KytyPS5 on the M4; uncached/@rpath loading, dyld runtime compatibility, unsupported instructions/syscalls, thread-local errno, guest threads/TLS, signals, exceptions, and framework ABI bridges remain likely blockers to resolve from the first target run.
 
+## Current shared-cache page-in implementation (November 17, 2026)
+
+Step 4 no longer eagerly allocates a private 4 KiB host page for every selected cache page. It reserves the merged guest VM ranges and registers compact lazy-backed page providers, split only at cache mapping and protection boundaries. This allows the current 556-image recursive closure (626,574 guest pages, about 2.39 GiB of guest virtual coverage) to be registered without immediately allocating that amount of host backing.
+
+When a guest read, write, or instruction fetch first touches one of these pages, Kestrel reads exactly 4 KiB from the retained primary/subcache backing, applies that mapping's slide-info v2 fixups to a private page buffer, copies the result into guest-owned backing, and installs the mapping's initial guest permissions. Subsequent accesses use that committed page. The source cache bytes remain unchanged. The lazy-range metadata is retained without per-page splitting; committed-page entries take precedence, avoiding repeated metadata sorting as more pages are touched.
+
+The native C/JIT helper reports a missing page separately from a protection fault. The Swift runtime now recognizes both demand-zero and cache-backed ranges, commits one permitted page, and retries the same guest instruction with its original RIP. The Swift guest-VM tests cover multi-gigabyte lazy range registration, page-in, private guest writes, and metadata lifetime. The native integration suite contains a MAP_JIT test for a cache-backed missing-page fault and retry. These additions are committed but have not yet been built or executed on the user's M4; actual KytyPS5 launch remains unverified.
 
 ## Recommended milestones
 
@@ -185,7 +193,7 @@ Kestrel can now execute a restricted freestanding x86_64 MH_EXECUTE by calling i
 4. **Complete as a tested initial slice — native AArch64 backend.** Register/immediate, memory, LEA, stack, and control-flow subsets passed 27 native differential test groups on the M4. Broaden the ISA only with additional reference comparisons.
 5. **Complete as an initial slice — block dispatcher and translation cache.** Basic-block splitting, guest-RIP redispatch, byte-validated LRU caching, stale-code detection, explicit invalidation, and bounded execution passed 8 native dispatcher test groups on the M4.
 6. **Implemented and demonstrated on the M4 — sparse guest VM and demand-zero JIT integration.** The seven v0.10.3 MAP_JIT tests passed on the user's M4, including one-page demand-zero fault/retry. v0.11 adds two more native integration tests for `SYSCALL` dispatch and the imported `_write` thunk; these two require M4 confirmation.
-7. **Implemented as load-only slices — Mach-O mapping, classic rebases, and initial bind processing.** The loader maps the main `MH_EXECUTE`, registers BSS/tails for demand-zero, and handles the supported classic pointer rebase subset. v0.11 decodes regular/weak/lazy bind actions and indexes basic exports. The current cache path plans and materializes the recursive cache-backed dependency closure, while import prebinding still supports a bounded set of classic bind forms; uncached/`@rpath` images and the main image's chained fixups are delegated to the real dyld path or remain future compatibility work.
+7. **Implemented as load-only slices — Mach-O mapping, classic rebases, and initial bind processing.** The loader maps the main `MH_EXECUTE`, registers BSS/tails for demand-zero, and handles the supported classic pointer rebase subset. v0.11 decodes regular/weak/lazy bind actions and indexes basic exports. The current cache path plans and registers the recursive cache-backed dependency closure as lazy guest ranges, applying slide-info v2 fixups when each page is first committed. Import prebinding still supports a bounded set of classic bind forms; uncached/`@rpath` images and the main image's chained fixups are delegated to the real dyld path or remain future compatibility work.
 8. **Implemented as an experimental launch path — Darwin bootstrap boundary.** A kernel-shaped `KernelArgs` stack, cached x86_64 dyld entry, and bounded execution to the main executable's `LC_MAIN` boundary exist. The first KytyPS5 run will determine which additional syscall, instruction, runtime, and image-loading behaviors must be implemented next.
 9. **Implemented as a bounded slice — STUB_AND_RESOLVER execution.** Positive-ordinal lazy imports can use a resolver's return only after isolated guest execution and executable-address validation; the resulting pointer is applied in the staged image. This is eager prebinding, not first-call lazy rebinding.
 10. **Implemented as a first executable slice — direct-main guest launcher.** Freestanding no-dependency x86_64 images can enter LC_MAIN through a C-compatible call frame and execute under the native dispatcher. This deliberately bypasses dyld and is not normal macOS application startup.
