@@ -32,8 +32,14 @@ enum X64ARM64DispatcherSelfTests {
         try verifySelfModifyingCodeInvalidation()
         passed.append("Changed guest code invalidates the stale block translation before execution")
 
+        try verifySparseCodePageGenerationCache()
+        passed.append("Sparse-VM cache hits use page generations and still verify bytes after a page changes")
+
         try verifyLoopInstructionLimit()
         passed.append("A guest loop redispatches through the cached block and stops at the instruction budget")
+
+        try verifySparseDispatchLimitDiagnostics()
+        passed.append("Sparse dispatch-limit diagnostics include instruction bytes, registers, recent RIPs, and cache statistics")
 
         try verifyMemoryFaultStopsDispatch()
         passed.append("Native guest-memory fault is surfaced to the dispatcher without advancing faulting RIP")
@@ -185,6 +191,83 @@ enum X64ARM64DispatcherSelfTests {
         }
     }
 
+
+
+    private static func verifySparseCodePageGenerationCache() throws {
+        var memory = try X64GuestVirtualMemory()
+        let pageSize = memory.pageSize
+        try memory.reserve(at: guestBase, byteCount: pageSize, kind: .image)
+        try memory.commit(at: guestBase, byteCount: pageSize, permissions: .readWrite)
+        try memory.writeBytes([
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xC3                          // ret
+        ], at: guestBase)
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readExecute)
+
+        var cache = X64ARM64TranslationCache(capacity: 8)
+        let original = try cache.block(at: guestBase, memory: &memory)
+        _ = try cache.block(at: guestBase, memory: &memory)
+        guard original.codePageGenerationStamps.count == 1,
+              cache.statistics.hits == 1,
+              cache.statistics.compilations == 1 else {
+            throw TestError.failed("unchanged executable page did not produce a generation-validated cache hit")
+        }
+
+        // A write elsewhere on the same page changes its generation but not
+        // this block's bytes. Validate once, refresh the stamp, and keep the
+        // compiled block instead of recompiling it on every later hit.
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readWrite)
+        try memory.writeBytes([0xAA], at: guestBase + 0x100)
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readExecute)
+        _ = try cache.block(at: guestBase, memory: &memory)
+        guard cache.statistics.hits == 2,
+              cache.statistics.compilations == 1,
+              cache.statistics.staleEntries == 0 else {
+            throw TestError.failed("unchanged code was recompiled after an unrelated write to its page")
+        }
+
+        // A real code-byte change must still invalidate and recompile.
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readWrite)
+        try memory.writeBytes([0x02], at: guestBase + 1)
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readExecute)
+        let updated = try cache.block(at: guestBase, memory: &memory)
+        guard updated.guestBytes[1] == 0x02,
+              cache.statistics.hits == 2,
+              cache.statistics.compilations == 2,
+              cache.statistics.staleEntries == 1 else {
+            throw TestError.failed("modified guest instruction bytes were reused from a stale generation")
+        }
+    }
+
+    private static func verifySparseDispatchLimitDiagnostics() throws {
+        var memory = try X64GuestVirtualMemory()
+        let pageSize = memory.pageSize
+        try memory.reserve(at: guestBase, byteCount: pageSize, kind: .image)
+        try memory.commit(at: guestBase, byteCount: pageSize, permissions: .readWrite)
+        try memory.writeBytes([0xEB, 0xFE], at: guestBase) // JMP to itself
+        try memory.protect(at: guestBase, byteCount: pageSize, permissions: .readExecute)
+
+        var state = X64CPUState(rip: guestBase)
+        var dispatcher = X64ARM64BlockDispatcher(cacheCapacity: 4)
+        do {
+            _ = try dispatcher.run(
+                state: &state,
+                memory: &memory,
+                until: guestBase + 0x100,
+                maximumInstructions: 64,
+                maximumBlocks: 4
+            )
+            throw TestError.failed("sparse infinite loop did not stop at the block budget")
+        } catch X64ARM64DispatcherError.blockLimitWithDiagnostics(let limit, let rip, let diagnostics) {
+            guard limit == 4, rip == guestBase,
+                  diagnostics.contains("Instruction bytes: EB FE"),
+                  diagnostics.contains("RAX=0x0000000000000000"),
+                  diagnostics.contains("Recent guest block RIPs:"),
+                  diagnostics.contains("Translation cache: hits=") else {
+                throw TestError.failed("sparse block-limit diagnostic omitted the current instruction, register state, history, or cache statistics")
+            }
+        }
+    }
 
     private static func verifyMemoryFaultStopsDispatch() throws {
         var memory = try X64GuestMemory(baseAddress: guestBase, size: memorySize)
