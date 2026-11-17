@@ -355,11 +355,14 @@ enum X64DyldSharedCacheSelfTests {
                 cacheSlideAmount: 0
             )
             let pageAddress: UInt64 = 0x7FFF_0000_0000
-            try expect(summary.imageCount == 1 && summary.pageCount == 1, "single dependency page materialized")
-            try expect(summary.byteCount == 0x1000 && summary.rebasedPointerCount == 2, "guest page bytes and v2 pointer count")
-            try expect(guestMemory.isCommitted(address: pageAddress), "cache page committed in guest VM")
-            try expect(guestMemory.permissions(at: pageAddress) == .readExecute, "cache mapping RX protection applied")
-            try expect(try guestMemory.readUnsigned(at: pageAddress + 0x800, byteCount: 8) == 0x7FFF_0000_1000, "first pointer rebuilt using v2 value-add")
+            try expect(summary.imageCount == 1 && summary.pageCount == 1, "single dependency page registered")
+            try expect(summary.byteCount == 0x1000 && summary.lazyRangeCount == 1 && summary.slideInfoMappingCount == 1, "lazy page, range and slide-info metadata")
+            try expect(!guestMemory.isCommitted(address: pageAddress) && guestMemory.isLazyBacked(address: pageAddress), "cache page remains uncommitted until first guest access")
+            try expect(guestMemory.permissions(at: pageAddress) == .readExecute, "lazy cache mapping exposes its RX protection")
+            try expect(try guestMemory.readUnsigned(at: pageAddress + 0x800, byteCount: 8) == 0x7FFF_0000_1000, "read-only cache view rebuilds first pointer using v2 value-add")
+            try expect(!guestMemory.isCommitted(address: pageAddress), "diagnostic read does not eagerly commit the guest page")
+            try expect(try guestMemory.resolveDemandZeroPage(at: pageAddress, access: .read), "first guest access commits the lazy cache page")
+            try expect(guestMemory.isCommitted(address: pageAddress), "cache page becomes guest-owned after page-in")
             try expect(try guestMemory.readUnsigned(at: pageAddress + 0x808, byteCount: 8) == 0x7FFF_0000_2000, "terminal pointer rebuilt using v2 value-add")
             let unchangedSource = try cache.readVMBytes(atVMAddress: pageAddress + 0x800, count: 8)
             let sourceWord = unchangedSource.enumerated().reduce(UInt64(0)) { $0 | (UInt64($1.element) << ($1.offset * 8)) }
@@ -377,8 +380,8 @@ enum X64DyldSharedCacheSelfTests {
                 cacheSlideAmount: 0x2000
             )
             try expect(explicitlySlidSummary.cacheSlideAmount == 0x2000, "nonzero cache slide is recorded")
-            try expect(try explicitlySlidMemory.readUnsigned(at: pageAddress + 0x800, byteCount: 8) == 0x7FFF_0000_3000, "explicit cache slide is added after value-add")
-            passed.append("Selected cache pages are privately copied, v2 value-add/slide reconstructed, source bytes preserved, and cache VM protections installed")
+            try expect(try explicitlySlidMemory.readUnsigned(at: pageAddress + 0x800, byteCount: 8) == 0x7FFF_0000_3000, "explicit cache slide is applied when the page is read")
+            passed.append("Selected cache pages are registered lazily, slide-info v2 fixups are applied on first access, source bytes remain unchanged, and cache permissions are enforced")
         }
 
         do {
@@ -398,50 +401,6 @@ enum X64DyldSharedCacheSelfTests {
             passed.append("Shared-cache materialization rolls back completely when a guest address reservation collides")
         }
 
-        do {
-            let url = try makeCacheFile()
-            defer { try? FileManager.default.removeItem(at: url) }
-            let cache = try X64DyldSharedCacheReader.open(url)
-            let overLimitBytes: UInt64 = 2 * 1024 * 1024 * 1024 + 0x1000
-            let segment = X64DyldSharedCacheImageSegmentPlan(
-                name: "__TEXT",
-                virtualAddress: 0x7FFF_0000_0000,
-                virtualSize: overLimitBytes,
-                pageRoundedAddress: 0x7FFF_0000_0000,
-                pageRoundedSize: overLimitBytes,
-                maximumProtection: 0x5,
-                initialProtection: 0x5
-            )
-            let image = X64DyldSharedCacheImagePlan(
-                installName: "/usr/lib/libSynthetic.dylib",
-                machHeaderAddress: 0x7FFF_0000_0000,
-                segmentPlans: [segment]
-            )
-            let oversizedPlan = X64DyldSharedCacheMappingPlan(
-                cacheUUID: cache.uuid,
-                images: [image],
-                slideInfoSummaries: [],
-                reservedMappingCount: 1,
-                totalVirtualBytes: overLimitBytes,
-                totalPageRoundedReservationBytes: overLimitBytes,
-                executableSegmentCount: 1,
-                linkeditSegmentCount: 0
-            )
-            var guestMemory = try X64GuestVirtualMemory()
-            var rejected = false
-            do {
-                _ = try X64DyldSharedCacheMaterializer.materialize(
-                    cache: cache,
-                    plan: oversizedPlan,
-                    into: &guestMemory
-                )
-            } catch {
-                rejected = error.localizedDescription.contains("2 GiB allocation safety limit")
-            }
-            try expect(rejected, "materializer must enforce the 2 GiB backing-allocation limit")
-            try expect(guestMemory.reservedRegionCount == 0 && guestMemory.committedPageCount == 0, "over-limit plan must not mutate guest memory")
-            passed.append("Shared-cache materialization rejects plans above the 2 GiB host-backing ceiling before allocating pages")
-        }
 
         do {
             let url = try makeCacheFile(includeSlideInfo: true, slideInfoVersion: 3)
