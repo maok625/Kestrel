@@ -91,7 +91,7 @@ extension SelfTestSuite {
         SelfTestSuite(
             id: "native-vm-jit",
             buttonTitle: "Native guest VM/JIT tests",
-            systemImage: "memorychip.and.cpu",
+            systemImage: "cpu",
             passSummary: "native AArch64 ↔ sparse guest-VM integration tests",
             failureLabel: "NATIVE GUEST-VM INTEGRATION TESTS",
             notes: [
@@ -189,6 +189,10 @@ final class LauncherViewModel: ObservableObject {
     private static let materializationLimitBytes: UInt64 = 2 * 1024 * 1024 * 1024
 
     private var logLines: [String] = [LauncherViewModel.readyMessage]
+    
+    /// Read-only line view for SwiftUI's LazyVStack. The underlying buffer is
+    /// already bounded by maximumLogLines and remains the source for Copy.
+    var displayedLogLines: [String] { logLines }
     private var target: TargetDescriptor?
     private var runningProcess: Process?
     private var loadedGuestMemory: X64GuestVirtualMemory?
