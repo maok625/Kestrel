@@ -113,6 +113,12 @@ enum X64GuestVMNativeIntegrationSelfTests {
         let report = try dispatcher.run(state: &state, memory: &memory, until: haltAddress)
 
         try expect(report.exit == .memoryFault(address: codeBase), "cross-page store did not surface a native memory fault at the faulting instruction")
+        guard let nativeFault = report.nativeMemoryFault else {
+            throw TestError.failed("native memory fault details were not preserved by the dispatcher")
+        }
+        try expect(nativeFault.guestAddress == sourceBase + page + 3, "native fault details did not report the last byte of the protected cross-page store")
+        try expect(nativeFault.access == .write, "native fault details reported the wrong access type")
+        try expect(report.faultingInstructionBytes == [0x48, 0x89, 0x03], "dispatcher did not preserve the faulting x86_64 instruction bytes")
         try expect(state.rip == codeBase, "faulting native store advanced guest RIP")
         try expect(try memory.readBytes(at: sourceBase + page - 4, count: 4) == [0xA1, 0xA2, 0xA3, 0xA4], "cross-page native store partially modified the writable first page")
         try expect(try memory.readBytes(at: sourceBase + page, count: 4) == [0xB1, 0xB2, 0xB3, 0xB4], "cross-page native store modified the read-only second page")
