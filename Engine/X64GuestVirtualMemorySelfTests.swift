@@ -171,12 +171,42 @@ enum X64GuestVirtualMemorySelfTests {
         try expect(memory.demandZeroReservedByteCount >= hugeLazySize - page, "large lazy range metadata was not preserved")
         passed.append("Demand-zero paging of a 4 GiB reservation backs only the single page actually touched")
 
+        let lazyBackedBase = hugeLazyBase + hugeLazySize + page * 4
+        let lazyBackedSize = page * 1_048_576
+        _ = try memory.reserve(at: lazyBackedBase, byteCount: lazyBackedSize, kind: .shared)
+        try memory.registerLazyBackedRange(
+            at: lazyBackedBase,
+            byteCount: lazyBackedSize,
+            permissions: .readWrite
+        ) { pageAddress in
+            Data(repeating: UInt8(truncatingIfNeeded: pageAddress >> 12), count: Int(page))
+        }
+        try expect(memory.lazyBackedRangeCount == 1, "large cache-backed range was not retained as compact metadata")
+        try expect(memory.lazyBackedReservedPageCount == 1_048_576, "large lazy-backed page count is incorrect")
+        try expect(memory.committedPageCount == beforeHugePageIn + 1, "registering a 4 GiB lazy-backed range allocated host pages")
+        try expect(memory.permissions(at: lazyBackedBase) == .readWrite, "uncommitted lazy-backed page does not expose its planned permissions")
+        let expectedFirstMarker = UInt8(truncatingIfNeeded: lazyBackedBase >> 12)
+        try expect(try memory.readBytes(at: lazyBackedBase + 7, count: 2) == [expectedFirstMarker, expectedFirstMarker], "read-only inspection did not retrieve lazy-backed source bytes")
+        try expect(!memory.isCommitted(address: lazyBackedBase), "read-only inspection eagerly committed a lazy-backed page")
+        let lastLazyPage = lazyBackedBase + lazyBackedSize - page
+        let committedBeforeLazyBackedPageIn = memory.committedPageCount
+        try expect(try memory.resolveDemandZeroPage(at: lastLazyPage, access: .read), "lazy-backed page-in did not resolve the final page")
+        try expect(memory.committedPageCount == committedBeforeLazyBackedPageIn + 1, "resolving a lazy-backed page committed more than one page")
+        let expectedLastMarker = UInt8(truncatingIfNeeded: lastLazyPage >> 12)
+        try expect(try memory.readBytes(at: lastLazyPage + 31, count: 1) == [expectedLastMarker], "lazy-backed page provider data was not copied into guest backing")
+        try memory.writeBytes([0xEE], at: lastLazyPage + 31)
+        try expect(try memory.readBytes(at: lastLazyPage + 31, count: 1) == [0xEE], "guest write did not update its private lazy-backed page")
+        try expect(memory.lazyBackedReservedPageCount == 1_048_575, "lazy-backed range did not consume exactly one page")
+        passed.append("A 4 GiB cache-backed guest range allocates only pages actually touched; guest writes modify private page copies")
+
+        try memory.release(at: lazyBackedBase)
         try memory.release(at: hugeLazyBase)
         try memory.release(at: writableLazyBase)
         try memory.release(at: executeLazyBase)
         try memory.release(at: lazyBase)
         try expect(memory.demandZeroRangeCount == 0, "releasing a reservation retained demand-zero metadata")
-        passed.append("Releasing image reservations discards their remaining demand-zero metadata and committed pages")
+        try expect(memory.lazyBackedRangeCount == 0, "releasing a reservation retained lazy-backed metadata")
+        passed.append("Releasing image reservations discards their remaining demand-zero and lazy-backed metadata and committed pages")
 
         try memory.release(at: largeBase)
         try expect(!memory.isReserved(address: largeBase + page * 7), "release did not remove reservation")
