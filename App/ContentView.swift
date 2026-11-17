@@ -208,14 +208,18 @@ struct ContentView: View {
         GroupBox {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(model.output)
-                            .font(.system(.callout, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.displayedLogLines.indices, id: \.self) { index in
+                            Text(model.displayedLogLines[index])
+                                .font(.system(.callout, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.horizontal, 8)
+                        }
                         Color.clear.frame(height: 1).id(Self.logBottomID)
                     }
+                    .padding(.vertical, 8)
                 }
                 .onChange(of: model.output) { _ in
                     proxy.scrollTo(Self.logBottomID, anchor: .bottom)
