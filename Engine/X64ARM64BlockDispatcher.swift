@@ -2,12 +2,20 @@ import Foundation
 
 // MARK: - Translated block and cache
 
+struct X64ARM64CodePageGenerationStamp: Sendable, Equatable {
+    let pageBase: UInt64
+    let generation: UInt64
+}
+
 struct X64ARM64CompiledBlock: Sendable {
     let startAddress: UInt64
     let endAddress: UInt64
     let guestBytes: [UInt8]
     let instructions: [X64IRInstruction]
     let arm64Words: [UInt32]
+    /// Generations of executable pages occupied by this block. Sparse-VM
+    /// cache hits can skip byte copying while these remain unchanged.
+    var codePageGenerationStamps: [X64ARM64CodePageGenerationStamp] = []
 
     var instructionCount: Int { instructions.count }
     var byteCount: Int { guestBytes.count }
@@ -114,31 +122,100 @@ struct X64ARM64TranslationCache {
            cached.instructionCount <= maximumInstructions,
            cached.byteCount <= maximumBytes,
            linearStopAddress.map({ cached.endAddress <= $0 }) ?? true {
-            let currentBytes = try memory.fetchAvailableBytes(at: startAddress, maximumCount: cached.byteCount)
-            if currentBytes.count == cached.guestBytes.count && currentBytes == cached.guestBytes {
+            // Native guest writes advance the generation of every touched
+            // page. An unchanged executable-page generation therefore proves
+            // this block's bytes are unchanged without allocating a byte array
+            // on every hot-loop cache hit.
+            if Self.codePageGenerationsMatch(cached.codePageGenerationStamps, memory: &memory) {
                 hits += 1
                 touch(startAddress)
                 return cached
+            }
+
+            // A page changed. Compare the actual bytes once: writes elsewhere
+            // on the same page should not force needless recompilation.
+            let currentBytes = try memory.fetchAvailableBytes(at: startAddress, maximumCount: cached.byteCount)
+            if currentBytes.count == cached.guestBytes.count && currentBytes == cached.guestBytes {
+                var refreshed = cached
+                refreshed.codePageGenerationStamps = Self.captureCodePageGenerations(
+                    at: refreshed.startAddress,
+                    byteCount: refreshed.byteCount,
+                    memory: &memory
+                )
+                entries[startAddress] = refreshed
+                hits += 1
+                touch(startAddress)
+                return refreshed
             }
             staleEntries += 1
             remove(startAddress)
         }
 
         misses += 1
-        let compiled = try buildBlock(
+        var compiled = try buildBlock(
             at: startAddress,
             memory: &memory,
             maximumInstructions: maximumInstructions,
             maximumBytes: maximumBytes,
             stopAddress: linearStopAddress
         )
+        compiled.codePageGenerationStamps = Self.captureCodePageGenerations(
+            at: compiled.startAddress,
+            byteCount: compiled.byteCount,
+            memory: &memory
+        )
         compilations += 1
         insert(compiled)
         return compiled
     }
 
+    private static func codePageGenerationsMatch(
+        _ stamps: [X64ARM64CodePageGenerationStamp],
+        memory: inout X64GuestVirtualMemory
+    ) -> Bool {
+        guard !stamps.isEmpty else { return false }
+        for stamp in stamps {
+            guard memory.pageGeneration(at: stamp.pageBase) == stamp.generation else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func captureCodePageGenerations(
+        at address: UInt64,
+        byteCount: Int,
+        memory: inout X64GuestVirtualMemory
+    ) -> [X64ARM64CodePageGenerationStamp] {
+        guard byteCount > 0,
+              UInt64(byteCount - 1) <= UInt64.max - address else {
+            return []
+        }
+
+        let firstPage = address & ~(memory.pageSize - 1)
+        let lastAddress = address + UInt64(byteCount - 1)
+        let lastPage = lastAddress & ~(memory.pageSize - 1)
+        var stamps: [X64ARM64CodePageGenerationStamp] = []
+        var pageBase = firstPage
+
+        while true {
+            guard let generation = memory.pageGeneration(at: pageBase) else {
+                return []
+            }
+            stamps.append(X64ARM64CodePageGenerationStamp(
+                pageBase: pageBase,
+                generation: generation
+            ))
+            if pageBase == lastPage { break }
+            guard pageBase <= UInt64.max - memory.pageSize else { return [] }
+            pageBase += memory.pageSize
+        }
+        return stamps
+    }
+
     /// Explicit invalidation is available to the future guest-memory manager.
-    /// The dispatcher also detects changes by comparing code bytes at lookup.
+    /// Page generations provide the fast validation path; changed pages are
+    /// still checked byte-for-byte before a cached translation is reused.
     mutating func invalidate(addressRange: Range<UInt64>) {
         guard !addressRange.isEmpty else { return }
         let addresses = entries.compactMap { address, block -> UInt64? in
@@ -363,6 +440,7 @@ enum X64ARM64DispatcherError: LocalizedError {
     case instructionExceedsBlockByteLimit(address: UInt64, instructionBytes: Int, maximumBytes: Int)
     case instructionLimit(limit: Int, rip: UInt64)
     case blockLimit(limit: Int, rip: UInt64)
+    case blockLimitWithDiagnostics(limit: Int, rip: UInt64, diagnostics: String)
 
     var errorDescription: String? {
         switch self {
@@ -382,6 +460,8 @@ enum X64ARM64DispatcherError: LocalizedError {
             return String(format: "Guest instruction limit reached (%d) at RIP 0x%016llX.", limit, rip)
         case .blockLimit(let limit, let rip):
             return String(format: "Guest block-dispatch limit reached (%d) at RIP 0x%016llX.", limit, rip)
+        case .blockLimitWithDiagnostics(let limit, let rip, let diagnostics):
+            return String(format: "Guest block-dispatch limit reached (%d) at RIP 0x%016llX.\\n%@", limit, rip, diagnostics)
         }
     }
 }
@@ -393,6 +473,9 @@ struct X64ARM64BlockDispatcher {
     private(set) var cache: X64ARM64TranslationCache
     private let maximumInstructionsPerBlock: Int
     private let maximumBytesPerBlock: Int
+    private var recentGuestRIPs: [UInt64] = Array(repeating: 0, count: 16)
+    private var recentGuestRIPCount = 0
+    private var nextRecentGuestRIPIndex = 0
 
     init(
         cacheCapacity: Int = 256,
@@ -402,6 +485,53 @@ struct X64ARM64BlockDispatcher {
         cache = X64ARM64TranslationCache(capacity: cacheCapacity)
         self.maximumInstructionsPerBlock = max(1, maximumInstructionsPerBlock)
         self.maximumBytesPerBlock = max(15, maximumBytesPerBlock)
+    }
+
+    private mutating func recordRecentGuestRIP(_ rip: UInt64) {
+        recentGuestRIPs[nextRecentGuestRIPIndex] = rip
+        nextRecentGuestRIPIndex = (nextRecentGuestRIPIndex + 1) % recentGuestRIPs.count
+        recentGuestRIPCount = min(recentGuestRIPCount + 1, recentGuestRIPs.count)
+    }
+
+    private func recentGuestRIPHistory(endingAt currentRIP: UInt64) -> [UInt64] {
+        guard recentGuestRIPCount > 0 else { return [currentRIP] }
+        let start = (nextRecentGuestRIPIndex - recentGuestRIPCount + recentGuestRIPs.count) % recentGuestRIPs.count
+        var history = (0..<recentGuestRIPCount).map {
+            recentGuestRIPs[(start + $0) % recentGuestRIPs.count]
+        }
+        if history.last != currentRIP {
+            if history.count == recentGuestRIPs.count {
+                history.removeFirst()
+            }
+            history.append(currentRIP)
+        }
+        return history
+    }
+
+    private func blockLimitDiagnostics(
+        state: X64CPUState,
+        memory: X64GuestVirtualMemory
+    ) -> String {
+        let bytesRemainingInPage = memory.pageSize - (state.rip & (memory.pageSize - 1))
+        let byteCount = Int(min(UInt64(15), bytesRemainingInPage))
+        let instructionBytes = (try? memory.fetchBytes(at: state.rip, maximumCount: byteCount)) ?? []
+        let instructionHex = instructionBytes.isEmpty
+            ? "unavailable"
+            : instructionBytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+        let registers = X64GeneralRegister.allCases.map {
+            String(format: "%@=0x%016llX", $0.name, state.registerValue($0))
+        }.joined(separator: " ")
+        let history = recentGuestRIPHistory(endingAt: state.rip)
+            .map { String(format: "0x%016llX", $0) }
+            .joined(separator: " -> ")
+        let statistics = cache.statistics
+
+        return [
+            "Instruction bytes: (instructionHex)",
+            String(format: "RFLAGS=0x%016llX; %@", state.rflags, registers),
+            "Recent guest block RIPs: (history)",
+            "Translation cache: hits=(statistics.hits), misses=(statistics.misses), compiled=(statistics.compilations), stale=(statistics.staleEntries), evictions=(statistics.evictions), entries=(statistics.entryCount)"
+        ].joined(separator: "\\n")
     }
 
     mutating func invalidateGuestCode(at address: UInt64, byteCount: Int) {
@@ -536,8 +666,14 @@ struct X64ARM64BlockDispatcher {
                 throw X64ARM64DispatcherError.instructionLimit(limit: maximumInstructions, rip: state.rip)
             }
             guard blocksExecuted < maximumBlocks else {
-                throw X64ARM64DispatcherError.blockLimit(limit: maximumBlocks, rip: state.rip)
+                let diagnostics = blockLimitDiagnostics(state: state, memory: memory)
+                throw X64ARM64DispatcherError.blockLimitWithDiagnostics(
+                    limit: maximumBlocks,
+                    rip: state.rip,
+                    diagnostics: diagnostics
+                )
             }
+            recordRecentGuestRIP(state.rip)
             if let hostThunks, let symbol = hostThunks.symbol(at: state.rip) {
                 let disposition = try X64DarwinHostThunkDispatcher.invoke(
                     symbol: symbol,
