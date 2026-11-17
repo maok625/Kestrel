@@ -60,6 +60,28 @@ enum X64DarwinRuntimeSelfTests {
             try expect(startup.dyldPath == "/usr/lib/dyld", "startup retains dyld path")
             try expect(memory.permissions(at: startup.stackReservation.baseAddress) == nil, "low stack guard")
             try expect(memory.permissions(at: startup.stackReservation.endAddress - 1) == nil, "high stack guard")
+
+            let commpage = X64GuestDarwinCommpage.baseAddress
+            let signature = Array("commpage 64-bit".utf8) + [0]
+            try expect(memory.region(containing: commpage)?.kind == .shared, "fixed x86_64 commpage reservation")
+            try expect(memory.isCommitted(address: commpage), "fixed x86_64 commpage is committed")
+            try expect(try memory.readBytes(at: commpage, count: 16) == signature, "x86_64 commpage signature")
+            try expect(try memory.readUnsigned(at: commpage + 0x1E, byteCount: 2) == 14, "x86_64 commpage layout version")
+            let commpageCapabilities = try memory.readUnsigned(at: commpage + 0x10, byteCount: 8)
+            try expect((commpageCapabilities & (1 << 62)) != 0, "commpage marks the guest as translated")
+            try expect((commpageCapabilities & (1 << 9)) != 0, "commpage reports 64-bit guest capability")
+            try expect(try memory.readBytes(at: commpage + 0x4E, count: 1) == [12], "commpage reports the 4 KiB x86_64 guest page shift")
+            try expect(memory.permissions(at: commpage) == .read, "x86_64 commpage is read-only")
+            var commpageWriteRejected = false
+            do {
+                try memory.writeBytes([0xFF], at: commpage)
+            } catch let fault as X64GuestVirtualMemoryFault {
+                commpageWriteRejected = fault.access == .write
+            }
+            try expect(commpageWriteRejected, "guest writes to the kernel-provided commpage are rejected")
+
+            passed.append("Read-only x86_64 Darwin commpage is mapped at 0x7fffffe00000 with its signature, version, and conservative capability fields")
+
             var initialState = X64CPUState()
             let dyldEntry: UInt64 = 0x6_FFFF_F000
             try startup.installDyldEntry(dyldEntryPoint: dyldEntry, into: &initialState)
