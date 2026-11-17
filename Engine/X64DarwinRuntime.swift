@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - Initial guest process state
@@ -26,6 +27,7 @@ enum X64GuestProcessStartupError: LocalizedError {
     case tooManyEnvironmentEntries
     case valueTooLarge
     case stackOverflow
+    case commpageAddressOccupied
 
     var errorDescription: String? {
         switch self {
@@ -33,6 +35,78 @@ enum X64GuestProcessStartupError: LocalizedError {
         case .tooManyEnvironmentEntries: return "Guest startup has more than 4096 environment entries."
         case .valueTooLarge: return "A guest startup string exceeds the 1 MiB safety limit."
         case .stackOverflow: return "The initial guest process data does not fit in the reserved stack."
+        case .commpageAddressOccupied: return "The fixed x86_64 Darwin commpage address is occupied by an incompatible guest mapping."
+        }
+    }
+}
+
+/// The fixed x86_64 Darwin commpage supplied by the kernel to every
+/// translated process. Kestrel maps only the read-only data page here; the
+/// separate commpage text page is installed only when its routines are emulated.
+enum X64GuestDarwinCommpage {
+    static let baseAddress: UInt64 = 0x0000_7FFF_FFE0_0000
+    static let byteCount: UInt64 = X64GuestVirtualMemoryConstants.pageSize
+    static let version: UInt16 = 14
+
+    private static let signature = Array("commpage 64-bit".utf8)
+
+    // Deliberately advertise no optional SIMD, AVX, or fast-GS-TLS support.
+    // Those features must not be selected until Kestrel implements them.
+    private static let capability64Bit: UInt64 = 1 << 9
+    private static let capabilityUP: UInt64 = 1 << 15
+    private static let capabilityOneCPU: UInt64 = 1 << 16
+    private static let capabilityIsTranslated: UInt64 = 1 << 62
+
+    static func install(into memory: inout X64GuestVirtualMemory) throws {
+        if let existing = memory.region(containing: baseAddress) {
+            guard existing.baseAddress == baseAddress,
+                  existing.byteCount == byteCount,
+                  existing.kind == .shared,
+                  memory.isCommitted(address: baseAddress),
+                  memory.permissions(at: baseAddress) == .read,
+                  try memory.readBytes(at: baseAddress, count: signature.count) == signature else {
+                throw X64GuestProcessStartupError.commpageAddressOccupied
+            }
+            return
+        }
+
+        _ = try memory.reserve(at: baseAddress, byteCount: byteCount, kind: .shared)
+        do {
+            try memory.commit(at: baseAddress, byteCount: byteCount, permissions: .readWrite)
+
+            var page = [UInt8](repeating: 0, count: Int(byteCount))
+            for (index, byte) in signature.enumerated() {
+                page[index] = byte
+            }
+
+            let capabilities = capabilityIsTranslated
+                | capabilityOneCPU
+                | capabilityUP
+                | capability64Bit
+            store(UInt64(capabilities), in: &page, at: 0x10)
+            store(version, in: &page, at: 0x1E)
+            store(UInt32(truncatingIfNeeded: capabilities), in: &page, at: 0x20)
+            page[0x34] = 1 // active CPUs
+            page[0x35] = 1 // physical CPUs
+            page[0x36] = 1 // logical CPUs
+            page[0x4D] = UInt8(getpagesize().trailingZeroBitCount) // host kernel page shift
+            page[0x4E] = 12 // x86_64 guest page shift (4 KiB)
+
+            try memory.writeBytes(page, at: baseAddress)
+            try memory.protect(at: baseAddress, byteCount: byteCount, permissions: .read)
+        } catch {
+            try? memory.release(at: baseAddress)
+            throw error
+        }
+    }
+
+    private static func store<T: FixedWidthInteger>(
+        _ value: T,
+        in bytes: inout [UInt8],
+        at offset: Int
+    ) {
+        for index in 0..<MemoryLayout<T>.size {
+            bytes[offset + index] = UInt8(truncatingIfNeeded: value >> (index * 8))
         }
     }
 }
@@ -63,6 +137,10 @@ enum X64GuestProcessStackBuilder {
         guard usableStackSize > 0, usableStackSize % memory.pageSize == 0 else {
             throw X64GuestProcessStartupError.stackOverflow
         }
+
+        // This fixed kernel-provided page is independent of the main stack
+        // and must exist before __dyld_start reads Darwin process metadata.
+        try X64GuestDarwinCommpage.install(into: &memory)
 
         let pageSize = memory.pageSize
         let twoGuards = pageSize.multipliedReportingOverflow(by: 2)
