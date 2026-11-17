@@ -922,6 +922,37 @@ final class LauncherViewModel: ObservableObject {
                     case .halted:
                         append("DYLD stopped without a matching main-entry handoff.")
                     }
+                    if let fault = result.1.report.nativeMemoryFault {
+                        let access = fault.access?.rawValue ?? "unknown permission \(fault.permission)"
+                        let pageBase = fault.guestAddress & ~(X64GuestVirtualMemoryConstants.pageSize - 1)
+                        let regionDescription: String
+                        if let region = result.0.region(containing: fault.guestAddress) {
+                            regionDescription = String(
+                                format: "%@ 0x%016llX + 0x%llX",
+                                region.kind.rawValue,
+                                region.baseAddress,
+                                region.byteCount
+                            )
+                        } else {
+                            regionDescription = "unmapped"
+                        }
+                        let protection = result.0.permissions(at: fault.guestAddress)?.description ?? "---"
+                        append(String(
+                            format: "DYLD NATIVE MEMORY FAULT: %@ at 0x%016llX (page 0x%016llX); committed=%@; demand-zero=%@; lazy-cache=%@; protection=%@; region=%@",
+                            access,
+                            fault.guestAddress,
+                            pageBase,
+                            result.0.isCommitted(address: fault.guestAddress) ? "yes" : "no",
+                            result.0.isDemandZero(address: fault.guestAddress) ? "yes" : "no",
+                            result.0.isLazyBacked(address: fault.guestAddress) ? "yes" : "no",
+                            protection,
+                            regionDescription
+                        ))
+                    }
+                    if let bytes = result.1.report.faultingInstructionBytes {
+                        let instructionHex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+                        append("DYLD FAULTING X86_64 INSTRUCTION at RIP 0x\(String(result.1.report.finalRIP, radix: 16)): \(instructionHex)")
+                    }
                     append(String(format: "dyld instructions=%d; blocks=%d; final RIP=0x%016llX",
                                   result.1.report.instructionsExecuted,
                                   result.1.report.blocksExecuted,
