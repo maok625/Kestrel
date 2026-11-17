@@ -52,6 +52,7 @@ enum X64GuestDarwinCommpage {
 
     // Deliberately advertise no optional SIMD, AVX, or fast-GS-TLS support.
     // Those features must not be selected until Kestrel implements them.
+    private static let capabilityCache32: UInt64 = 1 << 4
     private static let capability64Bit: UInt64 = 1 << 9
     private static let capabilityUP: UInt64 = 1 << 15
     private static let capabilityOneCPU: UInt64 = 1 << 16
@@ -83,9 +84,12 @@ enum X64GuestDarwinCommpage {
                 | capabilityOneCPU
                 | capabilityUP
                 | capability64Bit
-            store(UInt64(capabilities), in: &page, at: 0x10)
+                | capabilityCache32
+            store(capabilities, in: &page, at: 0x10)
             store(version, in: &page, at: 0x1E)
             store(UInt32(truncatingIfNeeded: capabilities), in: &page, at: 0x20)
+            store(UInt16(32), in: &page, at: 0x26) // conservative XNU default cache-line size
+            store(UInt64(ProcessInfo.processInfo.physicalMemory), in: &page, at: 0x38)
             page[0x34] = 1 // active CPUs
             page[0x35] = 1 // physical CPUs
             page[0x36] = 1 // logical CPUs
