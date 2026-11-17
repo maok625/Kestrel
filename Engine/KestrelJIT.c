@@ -216,8 +216,8 @@ static int kestrel_resolve_guest_span(KestrelGuestMemoryView *view,
     const size_t first_index = kestrel_find_guest_page(view, first_page);
     if (first_index == SIZE_MAX) {
         // A missing page may be backed lazily by Swift if this address belongs
-        // to a registered demand-zero image/stack/heap range. Fault code 2 is
-        // distinct from a protection fault (code 1).
+        // to a registered demand-zero or cache-backed guest range. Fault code
+        // 2 is distinct from a protection fault (code 1).
         view->fault = 2;
         view->fault_address = first_page;
         view->fault_permission = required_permission;
@@ -371,7 +371,7 @@ int kestrel_jit_execute_block_with_pages(const uint32_t *words,
     *fault_address_out = view.fault_address;
     *fault_permission_out = view.fault_permission;
     if (view.fault == 2) {
-        *block_result = 3; // Swift may resolve one demand-zero page and retry.
+        *block_result = 3; // Swift may page in demand-zero/cache-backed memory and retry.
     } else if (view.fault != 0) {
         *block_result = 2; // protection or invalid guest-memory fault.
     }
