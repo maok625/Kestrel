@@ -438,7 +438,7 @@ struct X64ARM64BlockDispatcher {
                 continue
             case .systemCall:
                 throw X64ARM64DispatcherError.systemCallRequiresSparseGuestVM
-            case .demandZeroFault:
+            case .missingPageFault:
                 // The contiguous compatibility fixture is always eagerly
                 // committed when adapted to the sparse VM, so this exit is
                 // not expected from its execution path.
@@ -562,10 +562,10 @@ struct X64ARM64BlockDispatcher {
                         cache: cache.statistics
                     )
                 }
-            case .demandZeroFault(let address, let access):
+            case .missingPageFault(let address, let access):
                 // Earlier instructions in this block completed and committed
                 // their guest state. The faulting instruction kept RIP, so
-                // resolve exactly one page and retry from that instruction.
+                // resolve exactly one demand-zero or cache-backed page and retry from that instruction.
                 instructionsExecuted += block.instructions.prefix { $0.address < state.rip }.count
                 if try memory.resolveDemandZeroPage(at: address, access: access) {
                     continue
