@@ -30,9 +30,9 @@ struct X64TranslationCacheStatistics: Sendable, Equatable {
     let entryCount: Int
 }
 
-/// A small bounded LRU cache. Entries are validated against the actual guest
-/// bytes every time they are looked up, so self-modifying code cannot silently
-/// reuse a stale translation at a later dispatcher boundary.
+/// A small bounded LRU cache. Sparse-VM entries use executable-page
+/// generations for the common unchanged-code path and verify bytes whenever a
+/// page changes, so self-modifying code cannot silently reuse stale translations.
 struct X64ARM64TranslationCache {
     private var entries: [UInt64: X64ARM64CompiledBlock] = [:]
     /// Monotonic last-use stamp per entry. Hits are O(1); the least recently
@@ -461,7 +461,7 @@ enum X64ARM64DispatcherError: LocalizedError {
         case .blockLimit(let limit, let rip):
             return String(format: "Guest block-dispatch limit reached (%d) at RIP 0x%016llX.", limit, rip)
         case .blockLimitWithDiagnostics(let limit, let rip, let diagnostics):
-            return String(format: "Guest block-dispatch limit reached (%d) at RIP 0x%016llX.\\n%@", limit, rip, diagnostics)
+            return String(format: "Guest block-dispatch limit reached (%d) at RIP 0x%016llX.\n%@", limit, rip, diagnostics)
         }
     }
 }
@@ -527,11 +527,11 @@ struct X64ARM64BlockDispatcher {
         let statistics = cache.statistics
 
         return [
-            "Instruction bytes: (instructionHex)",
+            "Instruction bytes: \(instructionHex)",
             String(format: "RFLAGS=0x%016llX; %@", state.rflags, registers),
-            "Recent guest block RIPs: (history)",
-            "Translation cache: hits=(statistics.hits), misses=(statistics.misses), compiled=(statistics.compilations), stale=(statistics.staleEntries), evictions=(statistics.evictions), entries=(statistics.entryCount)"
-        ].joined(separator: "\\n")
+            "Recent guest block RIPs: \(history)",
+            "Translation cache: hits=\(statistics.hits), misses=\(statistics.misses), compiled=\(statistics.compilations), stale=\(statistics.staleEntries), evictions=\(statistics.evictions), entries=\(statistics.entryCount)"
+        ].joined(separator: "\n")
     }
 
     mutating func invalidateGuestCode(at address: UInt64, byteCount: Int) {
