@@ -196,7 +196,7 @@ enum X64GuestVirtualMemorySelfTests {
         try expect(try memory.readBytes(at: lastLazyPage + 31, count: 1) == [expectedLastMarker], "lazy-backed page provider data was not copied into guest backing")
         try memory.writeBytes([0xEE], at: lastLazyPage + 31)
         try expect(try memory.readBytes(at: lastLazyPage + 31, count: 1) == [0xEE], "guest write did not update its private lazy-backed page")
-        try expect(memory.lazyBackedReservedPageCount == 1_048_575, "lazy-backed range did not consume exactly one page")
+        try expect(memory.lazyBackedReservedPageCount == 1_048_576, "lazy-backed range metadata was fragmented during page-in")
         passed.append("A 4 GiB cache-backed guest range allocates only pages actually touched; guest writes modify private page copies")
 
         try memory.release(at: lazyBackedBase)
