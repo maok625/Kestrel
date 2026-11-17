@@ -185,8 +185,6 @@ final class LauncherViewModel: ObservableObject {
 
     private static let readyMessage = "Kestrel is ready. Select a Mach-O executable or .app bundle."
     private static let maximumLogLines = 5_000
-    /// Hard ceiling for cache materialization, matched by the planner's estimate.
-    private static let materializationLimitBytes: UInt64 = 2 * 1024 * 1024 * 1024
 
     private var logLines: [String] = [LauncherViewModel.readyMessage]
     
@@ -573,8 +571,10 @@ final class LauncherViewModel: ObservableObject {
                 cachedDyldEntry = dyldEntry
                 cachedDependencyClosureIsComplete = dependencyClosure.isComplete
                 plannedDyldSharedCacheMappings = plan
-                let withinMaterializationLimit = plan.totalPageRoundedReservationBytes <= LauncherViewModel.materializationLimitBytes
-                canMaterializeCachedDependencies = withinMaterializationLimit && dependencyClosure.isComplete
+                // Cache pages are registered as sparse lazy-backed ranges.
+                // The planner's aggregate virtual-size limit remains in force;
+                // no host backing is allocated until guest code touches a page.
+                canMaterializeCachedDependencies = dependencyClosure.isComplete
                 canLaunchX64GuestViaDyld = false
                 append("PASS: recursive shared-cache dependency closure and mapping preflight completed.")
                 append("Cache UUID: \(plan.cacheUUID); images selected: \(plan.images.count); direct dependencies: \(dependencyClosure.rootImageCount); transitive dependencies: \(dependencyClosure.transitiveImageCount); dyld image: \(dyldEntry == nil ? "missing" : "included")")
@@ -596,12 +596,9 @@ final class LauncherViewModel: ObservableObject {
                 append("Cache VM mappings available: \(plan.reservedMappingCount); segment commands validated: \(plan.totalSegmentCount)")
                 append("Executable segments inventoried: \(plan.executableSegmentCount); __LINKEDIT segments: \(plan.linkeditSegmentCount)")
                 append("Exact guest segment bytes: \(plan.totalVirtualBytes); page-rounded reservation bytes: \(plan.totalPageRoundedReservationBytes) (virtual reservation only; no host pages allocated)")
-                let materializedPages = plan.totalPageRoundedReservationBytes / X64GuestVirtualMemoryConstants.pageSize
-                let materializedGiB = Double(plan.totalPageRoundedReservationBytes) / 1_073_741_824.0
-                append(String(format: "MATERIALIZATION ESTIMATE: %llu guest pages; %.2f GiB of host backing; hard allocation limit 2 GiB.", materializedPages, materializedGiB))
-                if !withinMaterializationLimit {
-                    append("BLOCKED: this page plan exceeds Kestrel's 2 GiB materialization allocation ceiling; no guest memory has been changed.")
-                }
+                let plannedPages = plan.totalPageRoundedReservationBytes / X64GuestVirtualMemoryConstants.pageSize
+                let plannedGiB = Double(plan.totalPageRoundedReservationBytes) / 1_073_741_824.0
+                append(String(format: "LAZY MATERIALIZATION PLAN: %llu guest pages; %.2f GiB of guest virtual coverage; host pages are allocated only on first permitted access.", plannedPages, plannedGiB))
                 let slidePages = plan.slideInfoSummaries.reduce(UInt64(0)) { $0 + $1.pageCount }
                 let rebasedPages = plan.slideInfoSummaries.reduce(UInt64(0)) { $0 + $1.pagesWithRebases }
                 let slideChains = plan.slideInfoSummaries.reduce(UInt64(0)) { $0 + $1.chainCount }
@@ -619,7 +616,7 @@ final class LauncherViewModel: ObservableObject {
                     }
                 }
                 if dependencyClosure.isComplete {
-                    append("PREFLIGHT COMPLETE: all discovered required cache-backed dependencies have validated segment mappings, including ordinary transitive LC_LOAD_DYLIB edges. The next action copies their pages into guest-owned backing, applies slide-info v2 fixups, then installs cache mapping protections.")
+                    append("PREFLIGHT COMPLETE: all discovered required cache-backed dependencies have validated segment mappings, including ordinary transitive LC_LOAD_DYLIB edges. The next action registers sparse cache-backed guest ranges; each 4 KiB page is copied and slide-info v2 fixed up on first permitted guest access.")
                     if dyldEntry != nil { append("The __dyld_start image is included in the same guest mapping transaction.") }
                 } else {
                     append("PREFLIGHT INCOMPLETE: do not materialize this partial closure as a launchable process. Resolve the missing or truncated dependency set first.")
@@ -643,8 +640,8 @@ final class LauncherViewModel: ObservableObject {
         isBusy = true
         Task {
             do {
-                // The cache scan and page copies can touch hundreds of MiB.
-                // Run the transaction away from the SwiftUI main actor.
+                // Registration is metadata-only, but run the cache validation
+                // and provider setup away from the SwiftUI main actor.
                 let result = try await Task.detached(priority: .userInitiated) {
                     var workingMemory = originalMemory
                     let summary = try X64DyldSharedCacheMaterializer.materialize(
@@ -662,12 +659,12 @@ final class LauncherViewModel: ObservableObject {
                 plannedDyldSharedCacheMappings = nil
                 canMaterializeCachedDependencies = false
                 canResolveCachedImports = true
-                append("PASS: cached dependency pages copied into guest-owned memory and slide-info v2 fixups applied.")
-                append("Cache UUID: \(result.1.cacheUUID); images: \(result.1.imageCount); guest pages: \(result.1.pageCount); bytes copied: \(result.1.byteCount)")
-                append("Guest regions reserved: \(result.1.reservedRegionCount); pointer words rebased: \(result.1.rebasedPointerCount); cache slide: 0x\(String(result.1.cacheSlideAmount, radix: 16))")
+                append("PASS: recursive cache page ranges registered for lazy guest page-in.")
+                append("Cache UUID: \(result.1.cacheUUID); images: \(result.1.imageCount); guest pages available: \(result.1.pageCount); guest virtual bytes: \(result.1.byteCount)")
+                append("Guest regions reserved: \(result.1.reservedRegionCount); lazy ranges: \(result.1.lazyRangeCount); slide-info mappings: \(result.1.slideInfoMappingCount); cache slide: 0x\(String(result.1.cacheSlideAmount, radix: 16))")
                 cachedDependenciesMaterialized = true
                 canLaunchX64GuestViaDyld = false
-                append("Cache bytes were never modified. Pages now carry the cache mapping's initial guest protections (including RX text and read-only linkedit). The mapped set includes the complete discovered recursive dependency closure and the x86_64 dyld image when present. Prepare KernelArgs with dyld_path next; then Kestrel can attempt __dyld_start.")
+                append("No cache pages were eagerly allocated. On first guest access, Kestrel loads one 4 KiB page, applies its slide-info v2 fixups to a private copy, and commits it with the cache mapping's initial protections (including RX text and read-only linkedit). The source cache remains unchanged. The lazy mapped set includes the complete discovered recursive dependency closure and the x86_64 dyld image when present. Prepare KernelArgs with dyld_path next; then Kestrel can attempt __dyld_start.")
             } catch {
                 append("DYLD CACHE MATERIALIZATION FAILED (guest-memory transaction rolled back): \(error.localizedDescription)")
             }
