@@ -136,6 +136,19 @@ private struct X64GuestDemandZeroRange: Sendable, Equatable {
     var endAddress: UInt64 { baseAddress + byteCount }
 }
 
+/// A metadata-only guest range whose bytes are supplied by a retained source
+/// on first access. The provider must return exactly one guest page. Kestrel
+/// then copies that page into private guest-owned backing, so subsequent guest
+/// writes cannot change the original source.
+private struct X64GuestLazyBackedRange: Sendable {
+    let baseAddress: UInt64
+    let byteCount: UInt64
+    let permissions: X64GuestMemoryPermissions
+    let pageProvider: @Sendable (UInt64) throws -> Data
+
+    var endAddress: UInt64 { baseAddress + byteCount }
+}
+
 /// Sparse, multi-region x86-64 guest virtual address space.
 ///
 /// Reservations consume metadata only. Physical backing is allocated a page
@@ -153,6 +166,7 @@ struct X64GuestVirtualMemory: Sendable {
     private(set) var regions: [X64GuestVirtualRegionInfo] = []
     private var committedPages: [UInt64: X64GuestCommittedPage] = [:]
     private var demandZeroRanges: [X64GuestDemandZeroRange] = []
+    private var lazyBackedRanges: [X64GuestLazyBackedRange] = []
     private(set) var mappingGeneration: UInt64 = 0
     private(set) var writeGeneration: UInt64 = 0
     private var pageGenerationClock: UInt64 = 0
@@ -186,6 +200,16 @@ struct X64GuestVirtualMemory: Sendable {
     }
     var demandZeroReservedPageCount: UInt64 {
         demandZeroReservedByteCount / pageSize
+    }
+    var lazyBackedRangeCount: Int { lazyBackedRanges.count }
+    var lazyBackedReservedByteCount: UInt64 {
+        lazyBackedRanges.reduce(UInt64(0)) { total, range in
+            let (sum, overflow) = total.addingReportingOverflow(range.byteCount)
+            return overflow ? UInt64.max : sum
+        }
+    }
+    var lazyBackedReservedPageCount: UInt64 {
+        lazyBackedReservedByteCount / pageSize
     }
 
     // MARK: Reservation and allocation
@@ -303,6 +327,7 @@ struct X64GuestVirtualMemory: Sendable {
             committedPages.removeValue(forKey: pageBase)
         }
         demandZeroRanges.removeAll { $0.baseAddress >= region.baseAddress && $0.endAddress <= region.endAddress }
+        lazyBackedRanges.removeAll { $0.baseAddress >= region.baseAddress && $0.endAddress <= region.endAddress }
         mappingGeneration &+= 1
     }
 
@@ -334,8 +359,38 @@ struct X64GuestVirtualMemory: Sendable {
         mappingGeneration &+= 1
     }
 
-    /// Resolves one missing guest page if it belongs to a registered
-    /// demand-zero range and the requested access is permitted. Returns false
+    /// Registers file/cache-backed bytes without allocating host page backing.
+    /// The provider is called once when a guest page is first resolved; the
+    /// returned bytes are copied into private guest-owned backing before the
+    /// page becomes visible to the native JIT.
+    mutating func registerLazyBackedRange(
+        at address: UInt64,
+        byteCount: UInt64,
+        permissions: X64GuestMemoryPermissions,
+        pageProvider: @escaping @Sendable (UInt64) throws -> Data
+    ) throws {
+        guard byteCount > 0 else { return }
+        _ = try validateRegionRange(address: address, byteCount: byteCount, access: .write)
+        let endAddress = address + byteCount
+        guard !demandZeroRanges.contains(where: { $0.baseAddress < endAddress && address < $0.endAddress }),
+              !lazyBackedRanges.contains(where: { $0.baseAddress < endAddress && address < $0.endAddress }) else {
+            throw fault(address, intLength(byteCount), .write, "lazy-backed range overlaps existing lazy metadata")
+        }
+        guard !committedPages.keys.contains(where: { $0 >= address && $0 < endAddress }) else {
+            throw fault(address, intLength(byteCount), .write, "lazy-backed range overlaps an already committed page")
+        }
+        lazyBackedRanges.append(X64GuestLazyBackedRange(
+            baseAddress: address,
+            byteCount: byteCount,
+            permissions: permissions,
+            pageProvider: pageProvider
+        ))
+        lazyBackedRanges.sort { $0.baseAddress < $1.baseAddress }
+        mappingGeneration &+= 1
+    }
+
+    /// Resolves one missing guest page if it belongs to a demand-zero or
+    /// lazy-backed range and the requested access is permitted. Returns false
     /// for ordinary uncommitted reservations or permission mismatches.
     @discardableResult
     mutating func resolveDemandZeroPage(
@@ -346,43 +401,91 @@ struct X64GuestVirtualMemory: Sendable {
         if let existing = committedPages[pageBase] {
             return existing.permissions.contains(access.requiredPermission)
         }
-        guard regionIndex(containing: pageBase) != nil,
-              let rangeIndex = demandZeroRanges.firstIndex(where: {
-                  pageBase >= $0.baseAddress && pageBase < $0.endAddress
-              }) else {
+        guard regionIndex(containing: pageBase) != nil else { return false }
+
+        if let rangeIndex = demandZeroRanges.firstIndex(where: {
+            pageBase >= $0.baseAddress && pageBase < $0.endAddress
+        }) {
+            let range = demandZeroRanges[rangeIndex]
+            guard range.permissions.contains(access.requiredPermission) else { return false }
+
+            pageGenerationClock &+= 1
+            committedPages[pageBase] = X64GuestCommittedPage(
+                backing: X64GuestPageBacking(byteCount: Int(pageSize)),
+                permissions: range.permissions,
+                generation: pageGenerationClock
+            )
+
+            demandZeroRanges.remove(at: rangeIndex)
+            if pageBase > range.baseAddress {
+                demandZeroRanges.append(X64GuestDemandZeroRange(
+                    baseAddress: range.baseAddress,
+                    byteCount: pageBase - range.baseAddress,
+                    permissions: range.permissions
+                ))
+            }
+            let pageEnd = pageBase + pageSize
+            if pageEnd < range.endAddress {
+                demandZeroRanges.append(X64GuestDemandZeroRange(
+                    baseAddress: pageEnd,
+                    byteCount: range.endAddress - pageEnd,
+                    permissions: range.permissions
+                ))
+            }
+            demandZeroRanges.sort { $0.baseAddress < $1.baseAddress }
+            mappingGeneration &+= 1
+            return true
+        }
+
+        guard let rangeIndex = lazyBackedRanges.firstIndex(where: {
+            pageBase >= $0.baseAddress && pageBase < $0.endAddress
+        }) else {
             return false
         }
-        let range = demandZeroRanges[rangeIndex]
+        let range = lazyBackedRanges[rangeIndex]
         guard range.permissions.contains(access.requiredPermission) else { return false }
 
-        // Backing allocations are zero-initialized by X64GuestPageBacking.
+        // Fetch and validate the page before publishing any VM state. A failed
+        // read or malformed provider response therefore leaves the range and
+        // committed-page table unchanged.
+        let pageBytes = try range.pageProvider(pageBase)
+        guard pageBytes.count == Int(pageSize) else {
+            throw fault(pageBase, Int(pageSize), access, "lazy-backed page provider returned \(pageBytes.count) bytes; expected \(pageSize)")
+        }
+
+        let backing = X64GuestPageBacking(byteCount: Int(pageSize))
+        try pageBytes.withUnsafeBytes { rawBytes in
+            guard let source = rawBytes.bindMemory(to: UInt8.self).baseAddress else {
+                throw fault(pageBase, Int(pageSize), access, "lazy-backed page provider returned an empty buffer")
+            }
+            backing.pointer.update(from: source, count: Int(pageSize))
+        }
         pageGenerationClock &+= 1
         committedPages[pageBase] = X64GuestCommittedPage(
-            backing: X64GuestPageBacking(byteCount: Int(pageSize)),
+            backing: backing,
             permissions: range.permissions,
             generation: pageGenerationClock
         )
 
-        // Remove exactly this page from the metadata range, retaining up to
-        // two sparse fragments. A single huge range therefore costs O(1)
-        // metadata per page that is actually faulted in.
-        demandZeroRanges.remove(at: rangeIndex)
+        lazyBackedRanges.remove(at: rangeIndex)
         if pageBase > range.baseAddress {
-            demandZeroRanges.append(X64GuestDemandZeroRange(
+            lazyBackedRanges.append(X64GuestLazyBackedRange(
                 baseAddress: range.baseAddress,
                 byteCount: pageBase - range.baseAddress,
-                permissions: range.permissions
+                permissions: range.permissions,
+                pageProvider: range.pageProvider
             ))
         }
         let pageEnd = pageBase + pageSize
         if pageEnd < range.endAddress {
-            demandZeroRanges.append(X64GuestDemandZeroRange(
+            lazyBackedRanges.append(X64GuestLazyBackedRange(
                 baseAddress: pageEnd,
                 byteCount: range.endAddress - pageEnd,
-                permissions: range.permissions
+                permissions: range.permissions,
+                pageProvider: range.pageProvider
             ))
         }
-        demandZeroRanges.sort { $0.baseAddress < $1.baseAddress }
+        lazyBackedRanges.sort { $0.baseAddress < $1.baseAddress }
         mappingGeneration &+= 1
         return true
     }
@@ -390,6 +493,11 @@ struct X64GuestVirtualMemory: Sendable {
     func isDemandZero(address: UInt64) -> Bool {
         let pageBase = address & ~(pageSize - 1)
         return demandZeroRanges.contains { pageBase >= $0.baseAddress && pageBase < $0.endAddress }
+    }
+
+    func isLazyBacked(address: UInt64) -> Bool {
+        let pageBase = address & ~(pageSize - 1)
+        return lazyBackedRanges.contains { pageBase >= $0.baseAddress && pageBase < $0.endAddress }
     }
 
     mutating func commit(
@@ -400,8 +508,8 @@ struct X64GuestVirtualMemory: Sendable {
         let region = try validateRegionRange(address: address, byteCount: byteCount, access: .write)
         _ = region
         let pageBases = pageBases(in: address, byteCount: byteCount)
-        for pageBase in pageBases where isDemandZero(address: pageBase) {
-            throw fault(pageBase, Int(pageSize), .write, "page is registered for demand-zero materialization; resolve its first guest access instead")
+        for pageBase in pageBases where isDemandZero(address: pageBase) || isLazyBacked(address: pageBase) {
+            throw fault(pageBase, Int(pageSize), .write, "page is registered for lazy materialization; resolve its first guest access instead")
         }
         for pageBase in pageBases where committedPages[pageBase] != nil {
             throw fault(pageBase, Int(pageSize), .write, "page is already committed")
@@ -737,6 +845,19 @@ struct X64GuestVirtualMemory: Sendable {
             )
             changed = true
         }
+        for index in lazyBackedRanges.indices {
+            let range = lazyBackedRanges[index]
+            guard range.permissions.contains(.write) else { continue }
+            var permissions = range.permissions
+            permissions.remove(.write)
+            lazyBackedRanges[index] = X64GuestLazyBackedRange(
+                baseAddress: range.baseAddress,
+                byteCount: range.byteCount,
+                permissions: permissions,
+                pageProvider: range.pageProvider
+            )
+            changed = true
+        }
 
         if changed {
             mappingGeneration &+= 1
@@ -747,7 +868,13 @@ struct X64GuestVirtualMemory: Sendable {
 
     func permissions(at address: UInt64) -> X64GuestMemoryPermissions? {
         let pageBase = address & ~(pageSize - 1)
-        return committedPages[pageBase]?.permissions
+        if let page = committedPages[pageBase] { return page.permissions }
+        if let range = demandZeroRanges.first(where: {
+            pageBase >= $0.baseAddress && pageBase < $0.endAddress
+        }) { return range.permissions }
+        return lazyBackedRanges.first(where: {
+            pageBase >= $0.baseAddress && pageBase < $0.endAddress
+        })?.permissions
     }
 
     func isReserved(address: UInt64) -> Bool {
@@ -790,20 +917,34 @@ struct X64GuestVirtualMemory: Sendable {
             guard regionIndex(containing: pageBase) != nil else {
                 throw fault(cursor, count - completed, access, "address is not reserved")
             }
-            guard let page = committedPages[pageBase] else {
-                throw fault(cursor, count - completed, access, "page is reserved but not committed")
-            }
-            guard page.permissions.contains(access.requiredPermission) else {
-                throw fault(cursor, count - completed, access, "page permissions are \(page.permissions), required \(access.requiredPermission)")
-            }
-
             let pageOffset = Int(cursor - pageBase)
             let chunkCount = min(count - completed, Int(pageSize) - pageOffset)
-            let source = UnsafeBufferPointer(
-                start: page.backing.pointer.advanced(by: pageOffset),
-                count: chunkCount
-            )
-            result.replaceSubrange(completed..<(completed + chunkCount), with: source)
+            if let page = committedPages[pageBase] {
+                guard page.permissions.contains(access.requiredPermission) else {
+                    throw fault(cursor, count - completed, access, "page permissions are \(page.permissions), required \(access.requiredPermission)")
+                }
+                let source = UnsafeBufferPointer(
+                    start: page.backing.pointer.advanced(by: pageOffset),
+                    count: chunkCount
+                )
+                result.replaceSubrange(completed..<(completed + chunkCount), with: source)
+            } else if let range = lazyBackedRanges.first(where: {
+                pageBase >= $0.baseAddress && pageBase < $0.endAddress
+            }) {
+                guard range.permissions.contains(access.requiredPermission) else {
+                    throw fault(cursor, count - completed, access, "lazy-backed page permissions are \(range.permissions), required \(access.requiredPermission)")
+                }
+                let pageBytes = try range.pageProvider(pageBase)
+                guard pageBytes.count == Int(pageSize) else {
+                    throw fault(pageBase, Int(pageSize), access, "lazy-backed page provider returned \(pageBytes.count) bytes; expected \(pageSize)")
+                }
+                result.replaceSubrange(
+                    completed..<(completed + chunkCount),
+                    with: pageBytes[pageOffset..<(pageOffset + chunkCount)]
+                )
+            } else {
+                throw fault(cursor, count - completed, access, "page is reserved but not committed")
+            }
             completed += chunkCount
             cursor += UInt64(chunkCount)
         }
