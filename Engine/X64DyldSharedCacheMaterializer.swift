@@ -8,7 +8,8 @@ struct X64DyldSharedCacheMaterializationSummary: Sendable, Equatable {
     let pageCount: UInt64
     let byteCount: UInt64
     let reservedRegionCount: Int
-    let rebasedPointerCount: UInt64
+    let lazyRangeCount: Int
+    let slideInfoMappingCount: Int
     let cacheSlideAmount: UInt64
 }
 
@@ -220,20 +221,20 @@ private struct X64DyldSharedCacheSlideInfoV2PageDecoder: Sendable {
     }
 }
 
-private struct X64DyldSharedCacheGuestPagePlan: Sendable {
-    let address: UInt64
+private struct X64DyldSharedCacheGuestLazyRangePlan: Sendable {
+    let range: Range<UInt64>
     let mapping: X64DyldSharedCacheMapping
     let finalPermissions: X64GuestMemoryPermissions
 }
 
 enum X64DyldSharedCacheMaterializer {
     private static let guestPageSize = X64GuestVirtualMemoryConstants.pageSize
-    private static let maximumMaterializedBytes: UInt64 = 2 * 1024 * 1024 * 1024
 
-    /// Materializes the union of all pages used by the selected cached images.
-    /// Pages are copied into guest-owned allocations, rebased in private page
-    /// buffers, then protected according to the cache mapping table. The
-    /// caller's VM is only replaced after every page succeeds.
+    /// Registers the union of selected cache pages as sparse, lazy-backed guest
+    /// mappings. No cache page is copied at registration time. On first guest
+    /// access, exactly one 4 KiB page is read, slide-info v2 fixups are applied
+    /// to its private copy, and the page is committed with the cache's initial
+    /// protections. The source shared-cache files remain immutable.
     @discardableResult
     static func materialize(
         cache: X64DyldSharedCacheSummary,
@@ -254,6 +255,11 @@ enum X64DyldSharedCacheMaterializer {
         }
         var pageCount: UInt64 = 0
         for range in pageRanges {
+            guard range.lowerBound % guestPageSize == 0,
+                  range.upperBound % guestPageSize == 0,
+                  range.upperBound > range.lowerBound else {
+                throw X64DyldSharedCacheError.malformed("Merged guest cache-page range is empty or not 4 KiB aligned.")
+            }
             let rangePageCount = (range.upperBound - range.lowerBound) / guestPageSize
             let (nextCount, overflow) = pageCount.addingReportingOverflow(rangePageCount)
             guard !overflow else {
@@ -262,56 +268,62 @@ enum X64DyldSharedCacheMaterializer {
             pageCount = nextCount
         }
         let (byteCount, byteOverflow) = pageCount.multipliedReportingOverflow(by: guestPageSize)
-        guard !byteOverflow, byteCount <= maximumMaterializedBytes,
-              byteCount == plan.totalPageRoundedReservationBytes,
-              pageCount <= UInt64(Int.max) else {
-            throw X64DyldSharedCacheError.malformed("Materialized cache pages exceed the 2 GiB allocation safety limit or disagree with the validated mapping plan.")
+        guard !byteOverflow, byteCount == plan.totalPageRoundedReservationBytes else {
+            throw X64DyldSharedCacheError.malformed("Lazy cache-page byte count disagrees with the validated mapping plan.")
         }
 
-        let pagePlans = try makeGuestPagePlans(ranges: pageRanges, mappings: cache.mappings, expectedCount: Int(pageCount))
+        // Split the compact merged ranges only where cache VM mappings or
+        // protections change. This avoids constructing 626k per-page plan
+        // objects just to register the dependency closure.
+        let lazyRangePlans = try makeLazyRangePlans(ranges: pageRanges, mappings: cache.mappings)
         let slideDecoders = try makeSlideDecoders(cache: cache)
 
-        // Work on a value copy and publish only after every reserve, copy,
-        // slide fixup, and protection transition succeeds. Existing guest
-        // pages are never modified by this transaction.
+        // Work on a VM value copy and publish only after all guest reservations
+        // and lazy source registrations succeed. No host page backing is
+        // allocated here, and an error leaves the caller's VM untouched.
         var workingMemory = guestMemory
-        let reservationRuns = contiguousRuns(pagePlans.map(\.address))
-        for run in reservationRuns {
-            try workingMemory.reserve(at: run.lowerBound, byteCount: run.upperBound - run.lowerBound, kind: .shared)
-            try workingMemory.commit(
-                at: run.lowerBound,
-                byteCount: run.upperBound - run.lowerBound,
-                permissions: .readWrite
+        for range in pageRanges {
+            try workingMemory.reserve(
+                at: range.lowerBound,
+                byteCount: range.upperBound - range.lowerBound,
+                kind: .shared
             )
         }
 
-        var rebasedPointerCount: UInt64 = 0
-        for pagePlan in pagePlans {
-            var pageBytes = try cache.readVMBytes(atVMAddress: pagePlan.address, count: Int(guestPageSize))
-            guard pageBytes.count == Int(guestPageSize) else {
-                throw X64DyldSharedCacheError.malformed(String(format: "Cache page 0x%016llX did not produce exactly 4096 source bytes.", pagePlan.address))
-            }
-            if let decoder = slideDecoders[pagePlan.mapping.address] {
-                let count = try decoder.applyFixups(
-                    to: &pageBytes,
-                    at: pagePlan.address,
-                    cacheSlideAmount: cacheSlideAmount
-                )
-                let (total, overflow) = rebasedPointerCount.addingReportingOverflow(count)
-                guard !overflow else {
-                    throw X64DyldSharedCacheError.malformed("Materialized cache pointer-fixup count overflows.")
+        for rangePlan in lazyRangePlans {
+            let cacheSnapshot = cache
+            let mapping = rangePlan.mapping
+            let decoder = slideDecoders[mapping.address]
+            try workingMemory.registerLazyBackedRange(
+                at: rangePlan.range.lowerBound,
+                byteCount: rangePlan.range.upperBound - rangePlan.range.lowerBound,
+                permissions: rangePlan.finalPermissions
+            ) { pageAddress in
+                guard pageAddress >= mapping.address,
+                      pageAddress <= mapping.endAddress,
+                      guestPageSize <= mapping.endAddress - pageAddress else {
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Lazy guest page 0x%016llX is not wholly contained in its cache mapping.", pageAddress)
+                    )
                 }
-                rebasedPointerCount = total
+                var pageBytes = try cacheSnapshot.readVMBytes(
+                    atVMAddress: pageAddress,
+                    count: Int(guestPageSize)
+                )
+                guard pageBytes.count == Int(guestPageSize) else {
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Cache page 0x%016llX did not produce exactly 4096 source bytes.", pageAddress)
+                    )
+                }
+                if let decoder {
+                    _ = try decoder.applyFixups(
+                        to: &pageBytes,
+                        at: pageAddress,
+                        cacheSlideAmount: cacheSlideAmount
+                    )
+                }
+                return pageBytes
             }
-            try workingMemory.writePageData(pageBytes, at: pagePlan.address)
-        }
-
-        for run in permissionRuns(pagePlans) {
-            try workingMemory.protect(
-                at: run.lowerBound,
-                byteCount: run.upperBound - run.lowerBound,
-                permissions: run.permissions
-            )
         }
 
         guestMemory = workingMemory
@@ -320,8 +332,9 @@ enum X64DyldSharedCacheMaterializer {
             imageCount: plan.images.count,
             pageCount: pageCount,
             byteCount: byteCount,
-            reservedRegionCount: reservationRuns.count,
-            rebasedPointerCount: rebasedPointerCount,
+            reservedRegionCount: pageRanges.count,
+            lazyRangeCount: lazyRangePlans.count,
+            slideInfoMappingCount: slideDecoders.count,
             cacheSlideAmount: cacheSlideAmount
         )
     }
@@ -344,46 +357,54 @@ enum X64DyldSharedCacheMaterializer {
         return decoders
     }
 
-    private static func makeGuestPagePlans(
+    private static func makeLazyRangePlans(
         ranges: [Range<UInt64>],
-        mappings: [X64DyldSharedCacheMapping],
-        expectedCount: Int
-    ) throws -> [X64DyldSharedCacheGuestPagePlan] {
-        var pages: [X64DyldSharedCacheGuestPagePlan] = []
-        pages.reserveCapacity(expectedCount)
+        mappings: [X64DyldSharedCacheMapping]
+    ) throws -> [X64DyldSharedCacheGuestLazyRangePlan] {
+        var plans: [X64DyldSharedCacheGuestLazyRangePlan] = []
         var mappingIndex = 0
 
         for range in ranges {
-            var pageAddress = range.lowerBound
-            while pageAddress < range.upperBound {
-                while mappingIndex < mappings.count && mappings[mappingIndex].endAddress <= pageAddress {
+            var cursor = range.lowerBound
+            while cursor < range.upperBound {
+                while mappingIndex < mappings.count && mappings[mappingIndex].endAddress <= cursor {
                     mappingIndex += 1
                 }
                 guard mappingIndex < mappings.count else {
-                    throw X64DyldSharedCacheError.malformed(String(format: "Cache page 0x%016llX is outside all cache mappings.", pageAddress))
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Cache guest page range beginning at 0x%016llX is outside all cache mappings.", cursor)
+                    )
                 }
                 let mapping = mappings[mappingIndex]
-                let (pageEnd, endOverflow) = pageAddress.addingReportingOverflow(guestPageSize)
-                guard !endOverflow, pageAddress >= mapping.address, pageEnd <= mapping.endAddress else {
-                    throw X64DyldSharedCacheError.malformed(String(format: "Guest page 0x%016llX is not wholly contained in one cache mapping.", pageAddress))
+                guard cursor >= mapping.address, cursor < mapping.endAddress else {
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Cache guest page range beginning at 0x%016llX is not covered by a cache mapping.", cursor)
+                    )
                 }
                 guard (mapping.maximumProtection & ~UInt32(0x7)) == 0,
                       (mapping.initialProtection & ~UInt32(0x7)) == 0,
                       (mapping.initialProtection & ~mapping.maximumProtection) == 0 else {
-                    throw X64DyldSharedCacheError.malformed(String(format: "Cache mapping at 0x%016llX has invalid or inconsistent VM protections.", mapping.address))
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Cache mapping at 0x%016llX has invalid or inconsistent VM protections.", mapping.address)
+                    )
                 }
-                pages.append(X64DyldSharedCacheGuestPagePlan(
-                    address: pageAddress,
+
+                let rangeEnd = min(range.upperBound, mapping.endAddress)
+                let rangeSize = rangeEnd - cursor
+                guard rangeSize > 0, rangeSize % guestPageSize == 0 else {
+                    throw X64DyldSharedCacheError.malformed(
+                        String(format: "Cache mapping at 0x%016llX ends inside a selected 4 KiB guest page.", mapping.address)
+                    )
+                }
+                plans.append(X64DyldSharedCacheGuestLazyRangePlan(
+                    range: cursor..<rangeEnd,
                     mapping: mapping,
                     finalPermissions: guestPermissions(mapping.initialProtection)
                 ))
-                pageAddress = pageEnd
+                cursor = rangeEnd
             }
         }
-        guard pages.count == expectedCount else {
-            throw X64DyldSharedCacheError.malformed("Unique cache guest-page count changed during materialization planning.")
-        }
-        return pages
+        return plans
     }
 
     private static func mergedPageRanges(
@@ -407,46 +428,6 @@ enum X64DyldSharedCacheMaterializer {
         }
         result.append(start..<end)
         return result
-    }
-
-    private static func contiguousRuns(_ addresses: [UInt64]) -> [Range<UInt64>] {
-        guard let first = addresses.first else { return [] }
-        var result: [Range<UInt64>] = []
-        var start = first
-        var end = first + guestPageSize
-        for address in addresses.dropFirst() {
-            if address == end {
-                end += guestPageSize
-            } else {
-                result.append(start..<end)
-                start = address
-                end = address + guestPageSize
-            }
-        }
-        result.append(start..<end)
-        return result
-    }
-
-    private static func permissionRuns(
-        _ pages: [X64DyldSharedCacheGuestPagePlan]
-    ) -> [(lowerBound: UInt64, upperBound: UInt64, permissions: X64GuestMemoryPermissions)] {
-        guard let first = pages.first else { return [] }
-        var result: [(UInt64, UInt64, X64GuestMemoryPermissions)] = []
-        var start = first.address
-        var end = first.address + guestPageSize
-        var permissions = first.finalPermissions
-        for page in pages.dropFirst() {
-            if page.address == end && page.finalPermissions == permissions {
-                end += guestPageSize
-            } else {
-                result.append((start, end, permissions))
-                start = page.address
-                end = page.address + guestPageSize
-                permissions = page.finalPermissions
-            }
-        }
-        result.append((start, end, permissions))
-        return result.map { (lowerBound: $0.0, upperBound: $0.1, permissions: $0.2) }
     }
 
     private static func guestPermissions(_ machProtection: UInt32) -> X64GuestMemoryPermissions {
