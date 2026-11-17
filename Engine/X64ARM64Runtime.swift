@@ -8,7 +8,7 @@ enum X64ARM64BlockExit: Equatable, Sendable {
     case controlFlow
     case systemCall
     case memoryFault
-    case demandZeroFault(address: UInt64, access: X64GuestMemoryAccess)
+    case missingPageFault(address: UInt64, access: X64GuestMemoryAccess)
 }
 
 struct X64ARM64BlockResult {
@@ -155,8 +155,8 @@ enum X64ARM64Runtime {
                 )
             }
 
-            if memory.isDemandZero(address: faultAddress) {
-                exit = .demandZeroFault(
+            if memory.isDemandZero(address: faultAddress) || memory.isLazyBacked(address: faultAddress) {
+                exit = .missingPageFault(
                     address: faultAddress,
                     access: access
                 )
