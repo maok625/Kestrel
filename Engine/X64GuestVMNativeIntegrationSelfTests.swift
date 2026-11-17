@@ -84,7 +84,7 @@ enum X64GuestVMNativeIntegrationSelfTests {
         let pageGenerationBefore = memory.pageGeneration(at: destinationBase)
         let writeGenerationBefore = memory.writeGeneration
         var state = X64CPUState(rip: codeBase, rflags: 0x202)
-        try state.writeRegister(.rbx, value: sourceBase + sourceOffset, width: .qword)
+        try state.writeRegister(.rbx, value: sourceBase + 0x80, width: .qword)
         try state.writeRegister(.rcx, value: destinationBase + 0x100, width: .qword)
         try state.writeRegister(.rsp, value: stackPointer, width: .qword)
         var dispatcher = X64ARM64BlockDispatcher(cacheCapacity: 8)
