@@ -327,6 +327,9 @@ enum X64DyldSharedCacheMaterializer {
         }
 
         guestMemory = workingMemory
+        let usedSlideInfoMappings = Set(lazyRangePlans.compactMap { rangePlan -> UInt64? in
+            slideDecoders[rangePlan.mapping.address] == nil ? nil : rangePlan.mapping.address
+        })
         return X64DyldSharedCacheMaterializationSummary(
             cacheUUID: cache.uuid,
             imageCount: plan.images.count,
@@ -334,7 +337,7 @@ enum X64DyldSharedCacheMaterializer {
             byteCount: byteCount,
             reservedRegionCount: pageRanges.count,
             lazyRangeCount: lazyRangePlans.count,
-            slideInfoMappingCount: slideDecoders.count,
+            slideInfoMappingCount: usedSlideInfoMappings.count,
             cacheSlideAmount: cacheSlideAmount
         )
     }
