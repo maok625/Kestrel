@@ -84,7 +84,7 @@ enum X64GuestVMNativeIntegrationSelfTests {
         let pageGenerationBefore = memory.pageGeneration(at: destinationBase)
         let writeGenerationBefore = memory.writeGeneration
         var state = X64CPUState(rip: codeBase, rflags: 0x202)
-        try state.writeRegister(.rbx, value: sourceBase + 0x80, width: .qword)
+        try state.writeRegister(.rbx, value: sourceBase + sourceOffset, width: .qword)
         try state.writeRegister(.rcx, value: destinationBase + 0x100, width: .qword)
         try state.writeRegister(.rsp, value: stackPointer, width: .qword)
         var dispatcher = X64ARM64BlockDispatcher(cacheCapacity: 8)
@@ -228,6 +228,7 @@ enum X64GuestVMNativeIntegrationSelfTests {
         try memory.reserve(at: sourceBase, byteCount: page, kind: .shared)
 
         let expectedValue: UInt64 = 0x8877_6655_4433_2211
+        let sourceOffset: UInt64 = 0x80
         try memory.registerLazyBackedRange(
             at: sourceBase,
             byteCount: page,
@@ -238,7 +239,7 @@ enum X64GuestVMNativeIntegrationSelfTests {
             }
             var bytes = Data(repeating: 0, count: Int(page))
             for index in 0..<8 {
-                bytes[index] = UInt8(truncatingIfNeeded: expectedValue >> (index * 8))
+                bytes[Int(sourceOffset) + index] = UInt8(truncatingIfNeeded: expectedValue >> (index * 8))
             }
             return bytes
         }
@@ -257,6 +258,10 @@ enum X64GuestVMNativeIntegrationSelfTests {
         let report = try dispatcher.run(state: &state, memory: &memory, until: haltAddress)
         try expect(report.exit == .halted && report.finalRIP == haltAddress, "lazy-backed native memory retry did not resume and halt")
         try expect(memory.isCommitted(address: sourceBase), "native fault did not commit the requested lazy-backed page")
+        try expect(
+            try memory.readUnsigned(at: sourceBase + sourceOffset, byteCount: 8) == expectedValue,
+            "lazy-backed page provider did not preserve bytes at the requested guest offset"
+        )
         try expect(try memory.readUnsigned(at: destinationBase + 0x100, byteCount: 8) == expectedValue, "native retry did not read the supplied cache-page bytes correctly")
         try expect(report.instructionsExecuted == 3, "lazy-backed retry double-counted or skipped a guest instruction")
         try expect(report.blocksExecuted >= 2, "native dispatcher did not retry after the lazy-backed page fault")
