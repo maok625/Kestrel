@@ -467,25 +467,9 @@ struct X64GuestVirtualMemory: Sendable {
             generation: pageGenerationClock
         )
 
-        lazyBackedRanges.remove(at: rangeIndex)
-        if pageBase > range.baseAddress {
-            lazyBackedRanges.append(X64GuestLazyBackedRange(
-                baseAddress: range.baseAddress,
-                byteCount: pageBase - range.baseAddress,
-                permissions: range.permissions,
-                pageProvider: range.pageProvider
-            ))
-        }
-        let pageEnd = pageBase + pageSize
-        if pageEnd < range.endAddress {
-            lazyBackedRanges.append(X64GuestLazyBackedRange(
-                baseAddress: pageEnd,
-                byteCount: range.endAddress - pageEnd,
-                permissions: range.permissions,
-                pageProvider: range.pageProvider
-            ))
-        }
-        lazyBackedRanges.sort { $0.baseAddress < $1.baseAddress }
+        // Keep the original range metadata intact. Committed-page lookup takes
+        // precedence on subsequent accesses, so one page-in never fragments
+        // or re-sorts a potentially huge cache range.
         mappingGeneration &+= 1
         return true
     }
@@ -497,6 +481,7 @@ struct X64GuestVirtualMemory: Sendable {
 
     func isLazyBacked(address: UInt64) -> Bool {
         let pageBase = address & ~(pageSize - 1)
+        guard committedPages[pageBase] == nil else { return false }
         return lazyBackedRanges.contains { pageBase >= $0.baseAddress && pageBase < $0.endAddress }
     }
 
