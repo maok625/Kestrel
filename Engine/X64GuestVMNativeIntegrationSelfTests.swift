@@ -56,6 +56,9 @@ enum X64GuestVMNativeIntegrationSelfTests {
         try verifyNativeDemandZeroDataPageRetry()
         passed.append("Native data-page faults materialize one demand-zero BSS page and retry the faulting instruction without losing guest state")
 
+        try verifyNativeLazyBackedPageRetry()
+        passed.append("Native JIT faults on an absent cache-backed page, loads and fixes up one private guest page, then retries the faulting instruction")
+
         try verifyTranslatedDarwinSyscallBoundary()
         passed.append("Translated SYSCALL exits to the Darwin dispatcher, saves RCX/R11, and returns process-exit status")
 
@@ -218,6 +221,46 @@ enum X64GuestVMNativeIntegrationSelfTests {
         try expect(report.blocksExecuted >= 2, "native path did not retry after demand-zero fault")
     }
 
+
+    private static func verifyNativeLazyBackedPageRetry() throws {
+        var memory = try X64GuestVirtualMemory()
+        try mapCode([0x48, 0x8B, 0x03, 0x48, 0x89, 0x01, 0xC3], in: &memory) // mov rax,[rbx]; mov [rcx],rax; ret
+        try memory.reserve(at: sourceBase, byteCount: page, kind: .shared)
+
+        let expectedValue: UInt64 = 0x8877_6655_4433_2211
+        try memory.registerLazyBackedRange(
+            at: sourceBase,
+            byteCount: page,
+            permissions: .read
+        ) { pageAddress in
+            guard pageAddress == sourceBase else {
+                throw TestError.failed("lazy cache page provider received an unexpected guest address")
+            }
+            var bytes = Data(repeating: 0, count: Int(page))
+            for index in 0..<8 {
+                bytes[index] = UInt8(truncatingIfNeeded: expectedValue >> (index * 8))
+            }
+            return bytes
+        }
+
+        try mapRegion(at: destinationBase, permissions: .readWrite, in: &memory)
+        try mapRegion(at: stackBase, permissions: .readWrite, in: &memory)
+        let stackPointer = stackBase + page - 8
+        try memory.writeUnsigned(haltAddress, at: stackPointer, byteCount: 8)
+
+        var state = X64CPUState(rip: codeBase, rflags: 0x202)
+        try state.writeRegister(.rbx, value: sourceBase + 0x80, width: .qword)
+        try state.writeRegister(.rcx, value: destinationBase + 0x100, width: .qword)
+        try state.writeRegister(.rsp, value: stackPointer, width: .qword)
+
+        var dispatcher = X64ARM64BlockDispatcher(cacheCapacity: 4)
+        let report = try dispatcher.run(state: &state, memory: &memory, until: haltAddress)
+        try expect(report.exit == .halted && report.finalRIP == haltAddress, "lazy-backed native memory retry did not resume and halt")
+        try expect(memory.isCommitted(address: sourceBase), "native fault did not commit the requested lazy-backed page")
+        try expect(try memory.readUnsigned(at: destinationBase + 0x100, byteCount: 8) == expectedValue, "native retry did not read the supplied cache-page bytes correctly")
+        try expect(report.instructionsExecuted == 3, "lazy-backed retry double-counted or skipped a guest instruction")
+        try expect(report.blocksExecuted >= 2, "native dispatcher did not retry after the lazy-backed page fault")
+    }
 
     private static func verifyTranslatedDarwinSyscallBoundary() throws {
         var memory = try X64GuestVirtualMemory()
