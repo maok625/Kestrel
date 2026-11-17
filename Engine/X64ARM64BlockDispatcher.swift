@@ -332,6 +332,26 @@ struct X64ARM64DispatchReport: Sendable {
     let finalRIP: UInt64
     let exit: X64ARM64DispatchExit
     let cache: X64TranslationCacheStatistics
+    let nativeMemoryFault: X64ARM64NativeMemoryFault?
+    let faultingInstructionBytes: [UInt8]?
+
+    init(
+        instructionsExecuted: Int,
+        blocksExecuted: Int,
+        finalRIP: UInt64,
+        exit: X64ARM64DispatchExit,
+        cache: X64TranslationCacheStatistics,
+        nativeMemoryFault: X64ARM64NativeMemoryFault? = nil,
+        faultingInstructionBytes: [UInt8]? = nil
+    ) {
+        self.instructionsExecuted = instructionsExecuted
+        self.blocksExecuted = blocksExecuted
+        self.finalRIP = finalRIP
+        self.exit = exit
+        self.cache = cache
+        self.nativeMemoryFault = nativeMemoryFault
+        self.faultingInstructionBytes = faultingInstructionBytes
+    }
 }
 
 enum X64ARM64DispatcherError: LocalizedError {
@@ -448,7 +468,9 @@ struct X64ARM64BlockDispatcher {
                     blocksExecuted: blocksExecuted,
                     finalRIP: state.rip,
                     exit: .memoryFault(address: state.rip),
-                    cache: cache.statistics
+                    cache: cache.statistics,
+                    nativeMemoryFault: nativeResult.nativeMemoryFault,
+                    faultingInstructionBytes: faultingInstructionBytes(in: block, at: state.rip)
                 )
             case .memoryFault:
                 // On a data fault, codegen leaves RIP at the faulting guest
@@ -459,7 +481,9 @@ struct X64ARM64BlockDispatcher {
                     blocksExecuted: blocksExecuted,
                     finalRIP: state.rip,
                     exit: .memoryFault(address: state.rip),
-                    cache: cache.statistics
+                    cache: cache.statistics,
+                    nativeMemoryFault: nativeResult.nativeMemoryFault,
+                    faultingInstructionBytes: faultingInstructionBytes(in: block, at: state.rip)
                 )
             }
         }
@@ -471,6 +495,21 @@ struct X64ARM64BlockDispatcher {
             exit: .halted,
             cache: cache.statistics
         )
+    }
+
+
+    private func faultingInstructionBytes(
+        in block: X64ARM64CompiledBlock,
+        at address: UInt64
+    ) -> [UInt8]? {
+        guard address >= block.startAddress, address < block.endAddress else { return nil }
+        let nextAddress = block.instructions.first(where: { $0.address > address })?.address ?? block.endAddress
+        guard nextAddress > address else { return nil }
+        let startOffset = Int(address - block.startAddress)
+        let byteCount = Int(nextAddress - address)
+        let endOffset = startOffset + byteCount
+        guard startOffset >= 0, endOffset <= block.guestBytes.count else { return nil }
+        return Array(block.guestBytes[startOffset..<endOffset])
     }
 
     /// Executes with the sparse page-based guest VM. Each instruction fetch
@@ -575,7 +614,9 @@ struct X64ARM64BlockDispatcher {
                     blocksExecuted: blocksExecuted,
                     finalRIP: state.rip,
                     exit: .memoryFault(address: state.rip),
-                    cache: cache.statistics
+                    cache: cache.statistics,
+                    nativeMemoryFault: nativeResult.nativeMemoryFault,
+                    faultingInstructionBytes: faultingInstructionBytes(in: block, at: state.rip)
                 )
             case .memoryFault:
                 instructionsExecuted += block.instructions.prefix { $0.address < state.rip }.count
@@ -584,7 +625,9 @@ struct X64ARM64BlockDispatcher {
                     blocksExecuted: blocksExecuted,
                     finalRIP: state.rip,
                     exit: .memoryFault(address: state.rip),
-                    cache: cache.statistics
+                    cache: cache.statistics,
+                    nativeMemoryFault: nativeResult.nativeMemoryFault,
+                    faultingInstructionBytes: faultingInstructionBytes(in: block, at: state.rip)
                 )
             }
         }
